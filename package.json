@@ -48,6 +48,7 @@
     "LICENSE",
     "DISCLAIMER.md",
     "CHANGELOG.md",
+    "THIRD_PARTY.md",
     "docs/*.md"
   ],
   "scripts": {

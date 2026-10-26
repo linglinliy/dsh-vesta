@@ -2,7 +2,7 @@
 
 > **⚠️ 先读 [DISCLAIMER.md](DISCLAIMER.md)**（个人非官方项目、无担保、结果需自行核对、
 > 与 VESTA / VASP 无隶属关系、不重分发 VESTA 文件与 POTCAR、VESTA/VASP 许可证义务在你身上）。
-> 版本 **0.0.1**，仅供研究与个人使用。
+> 版本 **0.0.1**，仅供研究与个人使用。许可：[MIT](LICENSE)；第三方组件（VESTA / VASP / three.js）见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 
 在对话里打开并**驱动**本机 VESTA，并对 VASP 输出做后处理。一份能力核心（[`core.js`](core.js)），两个前端：
 DSH 原生插件（[`index.js`](index.js)）与零依赖 MCP 服务器（[`mcp/server.js`](mcp/server.js)）。

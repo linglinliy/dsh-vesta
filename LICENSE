@@ -19,22 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-第三方组件说明
-
-本项目自身代码按上面的 MIT 许可发布，但**不含**以下软件的代码或数据：
-
-1. VESTA（Visualization for Electronic and STructural Analysis）
-   - 版权归其作者所有，采用独立的 VESTA 许可证。
-   - 本项目**不重分发** VESTA 的任何文件（包括可执行文件、MADELUNG、STRUCTURE_TIDY 等），
-     只在运行时调用**用户自行安装**的 VESTA。
-   - 使用者必须自行遵守 VESTA 许可证（含引用要求）。
-
-2. VASP
-   - 本项目**不包含** VASP 代码、赝势（POTCAR）或任何许可数据。
-   - 解析 VASP 输出文件不需要 VASP 许可证，但**运行 VASP / 使用 POTCAR 需要**用户自己的 VASP 许可证。
-
-3. three.js（vendor/ 下）
-   - MIT 许可，许可证文本见 `vendor/THREE-LICENSE.txt`。
