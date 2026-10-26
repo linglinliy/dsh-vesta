@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "VESTA Structure Opener",
+    "description": "Opens crystal structure files (POSCAR, CIF, CUBE, …) in the local VESTA installation from chat, and reports the install path, version mark, and recent files."
+  }
+}

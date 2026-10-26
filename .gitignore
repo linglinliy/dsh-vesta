@@ -1,0 +1,35 @@
+# 依赖与本地状态
+node_modules/
+.pnpm-store/
+pnpm-lock.yaml.bak
+
+# 运行产物
+.dsh/
+*.log
+npm-debug.log*
+*.tmp
+
+# 测试与本地产物（不要提交）
+*.local.*
+slab-report.csv
+table.md
+table.csv
+compare-*.html
+*-dos.html
+*-bands.html
+powder.html
+workfunction.html
+tool-*.html
+tool-*.csv
+tool-*.ted
+tool-*.led
+si-*.vasp
+si-*.csv
+si-*.txt
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

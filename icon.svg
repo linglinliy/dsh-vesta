@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="VESTA structure opener">
+  <rect width="64" height="64" rx="14" fill="#12212b"/>
+  <g fill="none" stroke="#5ec8d8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M32 9 L54 21 L54 43 L32 55 L10 43 L10 21 Z"/>
+    <path d="M32 9 L32 32 M32 32 L54 43 M32 32 L10 43"/>
+  </g>
+  <g fill="#f2b134">
+    <circle cx="32" cy="9" r="4"/>
+    <circle cx="54" cy="21" r="3.4"/>
+    <circle cx="10" cy="21" r="3.4"/>
+    <circle cx="32" cy="55" r="3"/>
+  </g>
+  <circle cx="32" cy="32" r="5.4" fill="#e8613c"/>
+</svg>

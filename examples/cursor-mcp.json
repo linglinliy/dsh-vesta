@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "vesta": {
+      "command": "node",
+      "args": ["<插件目录>/mcp/server.js"],
+      "env": {
+        "VESTA_EXE": "<VESTA 安装目录>/VESTA.exe"
+      }
+    }
+  }
+}

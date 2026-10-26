@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "VESTA 结构打开器",
+    "description": "从对话里直接调用本机 VESTA 打开 POSCAR/CIF/CUBE 等结构文件，并报告安装路径、版本标识与最近打开的结构。"
+  }
+}

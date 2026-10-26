@@ -1,0 +1,65 @@
+{
+  "name": "@local/dsh-vesta",
+  "version": "0.0.1",
+  "private": false,
+  "description": "在对话里驱动本机 VESTA，并做 VASP 后处理（结构/体积/DOS/能带/电荷/功函数），提供 DSH 原生插件与 MCP 服务器两种前端",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "vesta",
+    "vasp",
+    "dft",
+    "materials-science",
+    "mcp",
+    "crystallography"
+  ],
+  "bin": {
+    "vesta-mcp": "./mcp/server.js"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./core": "./core.js",
+    "./mcp/server": "./mcp/server.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "core.js",
+    "mcp/server.js",
+    "viewer/scene.js",
+    "viewer/webgl-viewer.js",
+    "vendor/three.module.js",
+    "vendor/ConvexHull.js",
+    "vendor/ConvexGeometry.js",
+    "vendor/THREE-LICENSE.txt",
+    "scripts/*.mjs",
+    "test/smoke.mjs",
+    "test/*.test.mjs",
+    "win/vesta-ui.ps1",
+    "examples/*.json",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "DISCLAIMER.md",
+    "CHANGELOG.md",
+    "docs/*.md"
+  ],
+  "scripts": {
+    "test": "node scripts/selfcheck.mjs",
+    "test:unit": "node --test test/*.test.mjs",
+    "toc": "node scripts/update-toc.mjs",
+    "toc:check": "node scripts/update-toc.mjs --check",
+    "mcp": "node mcp/server.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
