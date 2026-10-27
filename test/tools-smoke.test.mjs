@@ -8,7 +8,9 @@ import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
 import { apply } from '../index.js'
 
-const FIXTURE = '<本地任务根目录>/5.5'
+// 仓库里是脱敏占位路径；设了 VASP_FIXTURE_ROOT 就用真实数据
+const ROOT = process.env.VASP_FIXTURE_ROOT ?? '<本地任务根目录>'
+const FIXTURE = `${ROOT}/5.5`
 const available = existsSync(`${FIXTURE}/OUTCAR`)
 const skip = !available && '缺少 5.5 夹具'
 
@@ -54,9 +56,14 @@ test('vasp_dos：生成 DOS 图并回报积分电子数', { skip }, async () => 
   assert.ok(existsSync(result.path), `产物不存在：${result.path}`)
 })
 
-test('vesta_analyze：kind=structure 读出空间群与晶胞', { skip }, async () => {
+test('vesta_analyze：kind=structure 读出空间群与晶胞', { skip, timeout: 120000 }, async () => {
   const tools = loadTools()
-  const result = await tools.get('vesta_analyze').execute({ path: `${FIXTURE}/POSCAR`, kind: 'structure' }, {})
-  assert.equal(result.ok, true)
-  assert.match(result.summary, /3\.88909|41\.59|Fm/i)
+  try {
+    const result = await tools.get('vesta_analyze').execute({ path: `${FIXTURE}/POSCAR`, kind: 'structure' }, {})
+    assert.equal(result.ok, true)
+    assert.match(result.summary, /3\.88909|41\.59|Fm/i)
+  } finally {
+    const { stopUiHost } = await import('../core.js')
+    stopUiHost()
+  }
 })

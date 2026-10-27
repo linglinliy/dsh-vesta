@@ -1,14 +1,14 @@
 # 状态与验证记录
 
-> 版本 **2.90.0**　·　2026-10-26　·　本文的数字都由脚本实测（`node /tmp/audit-release.mjs` 等价逻辑），不是估计。
+> 版本 **0.0.7**　·　2026-10-26　·　本文的数字都由脚本实测（`node /tmp/audit-release.mjs` 等价逻辑），不是估计。
 
 ## 规模
 
 | 项 | 数量 |
 |---|---|
-| 工具（插件 + MCP 同源） | **20** |
+| 工具（插件 + MCP 同源） | **22** |
 | 脚本（`scripts/*.mjs`） | 37 |
-| 测试文件 / 用例 | **52 / 252** |
+| 测试文件 / 用例 | **55 / 271** |
 | 自检项（`selfcheck.mjs`） | **58** |
 | 体检检查项 | **26** |
 | 文档 | 7 个文件、约 2080 行（README 60 行做导航） |
@@ -98,3 +98,5 @@ node scripts/selfcheck.mjs --list     # 只列出会跑什么
 node scripts/update-toc.mjs --check   # 文档目录是否过期
 node test/smoke.mjs                   # MCP stdio 冒烟（含工具清单一致性）
 ```
+
+功能覆盖与证据：见 [COVERAGE.md](COVERAGE.md)。

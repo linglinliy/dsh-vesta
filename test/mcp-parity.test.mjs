@@ -36,7 +36,7 @@ test('MCP 与插件暴露同一批工具', () => {
   const plugin = pluginTools().map((tool) => tool.name).sort()
   const mcp = mcpTools().map((tool) => tool.name).sort()
   assert.deepEqual(mcp, plugin)
-  assert.equal(mcp.length, 20)
+  assert.equal(mcp.length, 28)
 })
 
 test('MCP 的 inputSchema 就是插件的 parameters', () => {

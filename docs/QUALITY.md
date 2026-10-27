@@ -151,3 +151,163 @@ node scripts/update-toc.mjs --check  # 只检查是否过期（过期退出码 1
 
 **过程中的一个修正**：第一版正则把下划线也删了，锚点变成 `#工具入口vestaanalyze`，
 测试立刻抓到——这正是把「文档格式」也纳入测试的好处。
+
+### 文档与实现的一致性审计（0.0.29）
+
+工具一多，最容易出的不是代码 bug，而是**文档漂移**：README 写 27 个工具、实际 28 个；
+MCP 说明写 20 个；某节引用了已经改名/删除的工具。这类问题人工看不出来，所以做成测试：
+
+`test/docs-consistency.test.mjs` 的 8 条检查：
+
+| 检查 | 抓什么问题 |
+|---|---|
+| 工具数与 `mcp/server.js` 说明一致 | MCP 自述的工具数过期 |
+| 文档里写的工具数与实际一致 | README / PROJECT 里的「N 个工具」过期 |
+| 文档提到的 `vesta_*` 工具真实存在 | 引用了不存在的工具 |
+| 每个工具都在文档里出现过 | 新工具忘了写文档 |
+| CHANGELOG 最新版本 == package.json | 忘了改版本号 |
+| COVERAGE 工具清单里没有「未实现」 | 状态标注自相矛盾 |
+| 每个 `vesta_*` 工具描述都有触发语 | 模型无法判断何时该用 |
+| 工具必填参数的 schema 合法 | 参数定义写坏 |
+
+首次运行就抓到 **6 处漂移**（README 27、PROJECT 20 ×2、VESTA.md 27、server.js 20 ×2），
+全部改为实际的 28 后通过。
+
+教训记在这里：**新的工具或版本，先改代码、再跑这个测试，让测试告诉你哪些文档还没跟上。**
+
+### 工具参数自检（0.0.31）
+
+0.0.30 抓到一个很隐蔽的回归：`vesta_render` 的执行体一直在读 `args.background` / `args.model`，
+但参数 schema 里没有这两项。因为 schema 是 `additionalProperties: false`，**真调用时这两个参数会被直接拒掉**，
+而单元测试只测了 `renderViewsWithCli`（核心函数），根本没经过 schema 校验。
+
+`test/tool-params.test.mjs` 就是为了让这类问题不可能再溜过去：
+
+| 检查 | 抓什么问题 |
+|---|---|
+| 执行体读的参数都在 schema 里声明过 | **0.0.16 那类回归**（读了但没声明） |
+| 声明的参数都在执行体里出现过 | 死参数（声明了但没用，用户传了也没效果） |
+| 每个工具都有 object 类型的 parameters | 定义写坏 |
+| 参数名不与 schema 保留字冲突 | 结构性错误 |
+| 工具名带已知前缀 | 命名漂移 |
+| 输出 required 是 properties 子集 | 输出契约不一致 |
+| **检测器自检** | 故意构造「读了 background 但没声明」的假定义，确认检查器真的能抓到 |
+
+做法上有个关键改动：工具是 `localTool({...})` 工厂包出来的，`definition.execute.toString()` 只能拿到包装器，
+看不到真实执行体。所以让 `localTool` 额外暴露 `executeSource`（原始函数源码），静态比对才有意义。
+
+参数既有解构写法 `execute({ path, out })`、也有 `execute(args)`，检查器两种都解析。
+
+### 测试隔离：别让用例互相抢 VESTA 窗口（0.0.33）
+
+全量跑测试时抓到一个**用例互相干扰**的问题：`input.test.mjs` 里那条「拖拽后画面哈希变化」的用例，
+原本的做法是「找当前正在运行的任意一个 VESTA 并拖它」——
+
+- 单独跑时能过；
+- 全量跑时，别的用例（场景渲染、elements.ini 渲染）会同时开关 VESTA 进程，它可能连到一个正在退出的窗口，
+  拖拽自然没反应，于是报 `拖拽之后画面应该变化` 失败。
+
+这不是产品 bug，是**测试设计 bug**。修法：用例自己开一个只含本用例结构的窗口（`openFiles` → 取最新进程 pid → 拖拽 → 关掉），
+并用 `finally` 保证进程被清理。修完后该用例耗时从 14 s（失败）变成 18 s（真实通过）。
+
+这条的普适教训：**凡是「找当前正在运行的进程」的测试，都会在并行/全量运行时变脆**；应该改成「自己创建、自己销毁」。
+
+### 不要按镜像名全局杀进程（0.0.34）
+
+0.0.33 修了「拖拽用例连错窗口」，但全量跑仍有 1 条失败：
+`真实 VESTA：同一组旋转参数两次出图哈希一致（确定性）` 耗 90 秒后报哈希不一致。
+
+**根因**：有两个测试用 `taskkill /IM VESTA.exe /F`（按镜像名杀全部）在渲染前后清场。
+全量跑是并行的，于是它们在别的用例渲染途中把那个 VESTA 干掉，出图自然不一致。
+单独跑这两个文件时都过，只有并行才炸——典型的**共享资源冲突**。
+
+修法：
+
+| 位置 | 原来 | 现在 |
+|---|---|---|
+| `tools-smoke4.test.mjs` | `taskkill /IM VESTA.exe /F` | 只杀自己 `vesta_open` 返回的 pid（`taskkill /PID <pid> /T /F`） |
+| `elements-ini.test.mjs` | 渲染前后各全局杀一次 | 干脆不杀：每次渲染都是 `-export_img … -close` 的新进程，自己会退出 |
+
+修完后把三个 VESTA 重负载套件放一起跑：全部通过，确定性用例从「90 s 失败」变成 **871 ms 通过**。
+
+core 里的 `renderViewsWithCli` / `analyzeWithVesta` 本来就是按 pid 清理（`taskkill /PID … /T /F`），
+所以产品代码没有这个问题——**只是测试写坏了**。但这也确认了一件产品行为：
+我们的工具不会去动用户自己开着的 VESTA 窗口。
+
+### 全量测试要串行跑（0.0.35）
+
+并行跑（Node 默认按 CPU 核数并发）时，多个用例会同时启动 VESTA：窗口抢焦点、`PrintWindow` 抓到别人的窗口、
+`-export_img` 互相拖慢甚至超时。表现为「单独跑都过、全量跑随机挂 1–2 条」。
+
+正确命令（串行）：
+
+```bash
+node --test --test-concurrency=1 test/*.test.mjs
+```
+
+并行时实测：368 例里随机会挂 2 条（拖拽哈希、`vesta_capture` 的 CLI 高清导出，后者 60 s 超时）。
+串行后这两条都稳定通过。
+
+判断依据很简单：**这类测试共享一个全局 GUI 资源（VESTA 进程/窗口）**，就不该并发。
+只跑纯计算用例（解析、几何、对称）时并行没问题，也快得多。
+
+### 真实夹具用环境变量驱动（0.0.36）
+
+仓库里的真实数据路径是**脱敏占位**（`<本地任务根目录>`），所以那些用例默认跳过。
+这样发布干净，但也意味着「跳过」不等于「没跑过」。现在补上环境变量入口：
+
+```bash
+VASP_FIXTURE_ROOT=<你的 VASP 任务根目录> \
+  node --test --test-concurrency=1 test/*.test.mjs
+```
+
+- `VASP_FIXTURE_ROOT`：VASP 任务根目录（下面要有 `5.5/` 等任务）；
+- `VASP_ADSORPTION_ROOT`：吸附任务目录（`slab_report` 用）。
+
+设了之后，`tools-smoke` / `tools-smoke2` / `tools-smoke4` 里原本跳过的用例会**真跑**：
+`vasp_report`、`vasp_table`、`vasp_dos`、`vesta_analyze`、`vasp_batch`、`xray_powder`、`volume_analyze`、
+`vesta_open`+`vesta_menu`+`vesta_control` 全部由 skip 变成实跑。
+
+**顺带修了一个会拖死整套的坑**：`tools-smoke4` 真去驱动 VESTA 时，常驻 PowerShell 宿主没被停掉，
+node 进程就一直挂着（表现为「卡住」而不是「失败」）。修法：给该用例加 `timeout: 180000`，
+并在 `finally` 里显式 `stopUiHost()`。修完 2 通过 / 1 跳过（缺吸附数据），不再挂。
+
+### 常驻宿主句柄必须跨模块实例共享（0.0.37）
+
+现象：`tools-smoke` 在真实夹具下**挂死不退**——测试全跑完了，node 进程却一直不走。
+
+诊断靠进程树，不靠猜：
+
+```
+node --test …  →  node (child)  →  powershell.exe -File …/vesta-ui.ps1 -Action host
+```
+
+**根因**：插件为了热重载用 `import('./core.js?rev=' + Date.now())`，每次都是**新的模块实例**；
+宿主的 `uiHostState` 只存在那个实例里。测试里另 `import('../core.js')` 调 `stopUiHost()` 时，
+那份实例的 `uiHostState` 是 `null`，什么都没停，PowerShell 子进程一直在，node 也就不退出。
+
+修法：
+
+1. 宿主句柄放到 `globalThis`；
+2. `startUiHost` / `stopUiHost` **每次都直接读 globalThis**（不能只在模块加载时读一次）；
+3. 再加 `process.on('exit')` 兜底清理。
+
+修完后 `tools-smoke` 真实夹具 **4/4 通过**、进程正常退出。
+
+### 一次假阳性：过滤字符串把当前 shell 也算进去了
+
+验证「有没有残留宿主」时，我用 `CommandLine -like '*vesta-ui.ps1*'` 数进程，结果总是 1 个。
+真相是**当前这条 pwsh 命令自己的命令行**里就包含 `vesta-ui.ps1` 这几个字，匹配到了自己。
+改成运行时拼接模式（`'vesta-ui' + '.ps1'`）并排除 `$PID` 之后：0 个残留。
+
+教训：**用命令行做进程匹配时，先排除「检查器自己」**，否则会得到一个永远为真的“证据”。
+
+### 最终验收怎么跑（一次只跑一件事）
+
+全量测试与 `selfcheck.mjs` 都会启动 VESTA，**不能同时跑**：实测同时跑会出现 1–3 条真 VESTA 用例失败
+（拖拽哈希、模板渲染），单独跑又全过。所以验收顺序是：
+
+```bash
+node --test --test-concurrency=1 test/*.test.mjs   # 先跑全量，跑完再跑下一句
+node scripts/selfcheck.mjs
+```

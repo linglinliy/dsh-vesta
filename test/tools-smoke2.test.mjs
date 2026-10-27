@@ -10,7 +10,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../index.js'
 
-const ROOT = '<本地任务根目录>'
+// 仓库里是脱敏占位路径；设了 VASP_FIXTURE_ROOT 就用真实数据
+const ROOT = process.env.VASP_FIXTURE_ROOT ?? '<本地任务根目录>'
 const SI = `${ROOT}/5.5`
 const C2 = `${ROOT}/latticefine_C2_a2p464_k25`
 const hasSi = existsSync(`${SI}/OUTCAR`)

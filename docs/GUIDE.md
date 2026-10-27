@@ -77,6 +77,8 @@ node scripts/check-volume.mjs <CHGCAR|CUBE|ELFCAR|LOCPOT>
 node scripts/vesta-crosscheck.mjs <CHGCAR|CHG|PARCHG>   # 用 VESTA 导出文本体积逐点校验解析
 
 node scripts/selfcheck.mjs          # 单测 + 冒烟 + 生成器端到端（19 项）
+
+node scripts/test-real-fixtures.mjs # 真实夹具套件逐个独立进程跑（每个文件跑完清理 VESTA）
 ```
 
 出错时脚本给一行中文提示 + 退出码 2（不会甩堆栈）。例如：

@@ -304,7 +304,19 @@ export function apply(ctx, config) {
       ctx.tools.register(tableTool(ctx)),
       ctx.tools.register(trajectoryTool(ctx)),
       ctx.tools.register(pdosTool(ctx)),
+      ctx.tools.register(inputTool(ctx)),
+      ctx.tools.register(renderTool(merged, ctx)),
+      ctx.tools.register(editTool(merged, ctx)),
+      ctx.tools.register(vectorTool(ctx)),
+      ctx.tools.register(volumeExportTool(ctx)),
+      ctx.tools.register(measureTool(ctx)),
+      ctx.tools.register(volumeDisplayTool(ctx)),
+      ctx.tools.register(styleTool(ctx)),
     ]
+    // 常驻宿主是一个 powershell 子进程：插件卸载时一起收掉，避免留下僵尸进程
+    disposers.unshift(() => {
+      import('./core.js').then((core) => core.stopUiHost?.()).catch(() => {})
+    })
     return () => {
       for (const dispose of disposers.reverse()) dispose()
     }
@@ -472,7 +484,19 @@ const CONTROL_PARAMS = {
   additionalProperties: false,
   required: ['action'],
   properties: {
-    action: { type: 'string', enum: ['list', 'click', 'settext'], description: 'list=列出控件；click=点击；settext=写入文本' },
+    action: {
+      type: 'string',
+      enum: ['list', 'click', 'settext', 'transform-cell', 'delete-atom'],
+      description: 'list=列出控件；click=点击；settext=写入文本（WM_SETTEXT，后台有效）；'
+        + 'transform-cell=在 VESTA 里完成 Unit Cell Transformation（填矩阵并走完全部确认框）；'
+        + 'delete-atom=在 Edit Data 里选中原子列表的一行并删除（行选中需真实点击兜底）',
+    },
+    row: { type: 'integer', description: 'delete-atom 用：要删除的原子行号（0 基），默认 0。', minimum: 0 },
+    matrix: {
+      type: 'array',
+      description: 'transform-cell 用：3×3 整数变换矩阵，如 [[2,0,0],[0,2,0],[0,0,2]] 表示 2×2×2 扩胞。',
+      items: { type: 'array', items: { type: 'integer' } },
+    },
     window: { type: 'string', description: '目标窗口：dialog（默认，当前对话框）| main | hwnd 数字' },
     pid: { type: 'integer', description: 'VESTA 进程 pid（多窗口时指定作用在哪个窗口；pid 见 vesta_open 返回）。' },
     hwnd: { type: 'integer', description: '控件 hwnd（从 list 结果里取）' },
@@ -527,6 +551,35 @@ const controlTool = () => localTool({
   presentCall: (args) => ({ card: 'generic', title: `VESTA control: ${args.action ?? ''}`, kind: 'other', rawInput: args }),
   async execute(args) {
     const window = typeof args.window === 'string' && args.window.length > 0 ? args.window : 'dialog'
+    if (args.action === 'delete-atom') {
+      const target = Number.isInteger(args.pid) ? args.pid : (await listControls(window)).window.pid
+      const result = await deleteAtomInVesta(target, { row: args.row })
+      return {
+        ok: true,
+        summary: [
+          '已在 VESTA 里删除一个原子行（PostMessage 优先 + 行选中用真实点击兜底）：',
+          ...result.steps.map((step) => '  ' + step),
+        ].join('\n'),
+        window: 0,
+        action: 'delete-atom',
+        controls: [],
+      }
+    }
+    if (args.action === 'transform-cell') {
+      const target = Number.isInteger(args.pid) ? args.pid : (await listControls(window)).window.pid
+      const result = await transformCellInVesta(target, args.matrix)
+      return {
+        ok: true,
+        summary: [
+          '已在 VESTA 里完成晶胞变换（纯 PostMessage，未抢焦点、未动光标）：',
+          ...result.steps.map((step) => '  ' + step),
+          '矩阵：' + result.matrix.map((row) => row.join(' ')).join(' / '),
+        ].join('\n'),
+        window: 0,
+        action: 'transform-cell',
+        controls: [],
+      }
+    }
     if (args.action === 'list') {
       // window 优先于 pid：同时给两者时应按 window 定位（曾经 pid 覆盖 window，指定 hwnd 却列到主窗口）
       const listTarget = args.window !== undefined && args.window !== null && String(args.window).length > 0
@@ -610,6 +663,10 @@ const VIEW_PARAMS = {
       description: '参照体积文件（CHGCAR / .cube）：给了就画「volume − volumeRef」的差密度，正蓝负红。'
         + '典型用法：吸附前后的电荷密度差、两个自旋通道之差。要求两者网格维度一致。',
     },
+    isoValue: {
+      type: 'number',
+      description: '等值面的精确密度阈值（与体积数据同单位，如 e/Å³）：内部换算成百分比再渲染，用来回答「等值面画在 0.05 e/Å³」这类精确要求（VESTA 的 GUI 只能按 +/- 步进）。',
+    },
     isoPercent: {
       type: 'integer',
       description: '等值面阈值百分比（1–95，相对体积数据的最大/最小量程），默认 15。',
@@ -691,13 +748,32 @@ const viewTool = (ctx) => localTool({
       const target = resolveTarget(item, base)
       const record = core.exportStructureForViewer(target, { repeat: args.repeat, outDir: args.outDir })
       if (args.renderer === 'webgl') {
+        // 精确阈值：把目标密度值换算成百分比（我们自己的渲染器只认百分比）
+        let isoSolved = null
+        if (Number.isFinite(Number(args.isoValue))) {
+          const volumePath = core.resolveTarget(String(args.volume ?? target), base)
+          const volumeData = core.readVolumeFile(volumePath)
+          const percent = core.volumePercentForValue(volumeData, Number(args.isoValue))
+          const clamped = Math.max(1, Math.min(95, Math.round(percent)))
+          isoSolved = { value: Number(args.isoValue), percent: clamped, raw: percent }
+        }
         const first = record.pdb
         const viewerPath = first.replace(/\.pdb$/i, '') + '-VESTA风.html'
-        const generated = await core.generateWebglViewer(target, { repeat: args.repeat, out: viewerPath, volume: args.volume, volumeRef: args.volumeRef, isoPercent: args.isoPercent })
+        const generated = await core.generateWebglViewer(target, {
+          repeat: args.repeat,
+          out: viewerPath,
+          volume: args.volume,
+          volumeRef: args.volumeRef,
+          isoPercent: isoSolved ? isoSolved.percent : args.isoPercent,
+        })
+        if (isoSolved) {
+          record.isoNote = '等值面阈值 ' + isoSolved.value + ' → 第 ' + isoSolved.percent + ' 百分位（原始换算 ' + isoSolved.raw.toFixed(2) + '%，渲染器限制 1–95%）'
+        }
         record.viewer = generated.out
       }
       structures.push(record)
     }
+    const isoNotes = structures.map((item) => item.isoNote).filter(Boolean)
     const lines = structures.map((item) => {
       const cell = item.cell
       const repeatText = item.repeat.join('×')
@@ -706,7 +782,7 @@ const viewTool = (ctx) => localTool({
     })
     return {
       ok: true,
-      summary: `已生成 ${structures.length} 个带晶胞参数的结构文件：\n${lines.join('\n')}\n下一步：需要交互查看时用 renderer="webgl" 生成离线 HTML 查看器（本 profile 里没有独立的三维面板工具）；也可以直接在 VESTA 里打开 PDB/CIF。`,
+      summary: `已生成 ${structures.length} 个带晶胞参数的结构文件：\n${lines.join('\n')}${isoNotes.length > 0 ? '\n' + isoNotes.join('\n') : ''}\n下一步：需要交互查看时用 renderer="webgl" 生成离线 HTML 查看器（本 profile 里没有独立的三维面板工具）；也可以直接在 VESTA 里打开 PDB/CIF。`,
       structures,
     }
   },
@@ -1746,3 +1822,1119 @@ const checkStructureTool = (ctx) => localTool({
     }
   },
 })
+
+// ---------------------------------------------------------------------------
+// 输入注入工具（鼠标/键盘直接操作 3D 视图，见 win/vesta-ui.ps1 的 drag/wheel/key/clickat/type）
+// ---------------------------------------------------------------------------
+
+const INPUT_PARAMS = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['action'],
+  properties: {
+    action: {
+      type: 'string',
+      enum: ['drag', 'wheel', 'key', 'click', 'type', 'undo', 'redo'],
+      description: 'drag=拖拽旋转；wheel=滚轮缩放；key=按键；click=视图内点击；type=打字；undo=撤销上一次拖拽/缩放/按键；redo=重做',
+    },
+    pid: { type: 'integer', description: 'VESTA 进程 pid（多窗口时指定作用在哪个窗口；取自 vesta_open 返回）。' },
+    dx: { type: 'number', description: 'drag：水平位移，像素，正数向右（默认 120）。' },
+    dy: { type: 'number', description: 'drag：垂直位移，正数向下（默认 0）。' },
+    x: { type: 'number', description: '起点或点击点的客户区 X；省略取视图中心。' },
+    y: { type: 'number', description: '同上，Y。' },
+    delta: { type: 'number', description: 'wheel：滚动量，正数放大（默认 120，一格）。' },
+    count: { type: 'integer', description: 'wheel/key：重复次数（默认 1）。' },
+    key: { type: 'string', description: 'key：键名 left/right/up/down/pageup/pagedown/home/end/plus/minus（也可给虚拟键码数字）。' },
+    ctrl: { type: 'boolean', description: 'key：是否按住 Ctrl。' },
+    text: { type: 'string', description: 'type：要输入的文本。' },
+    enter: { type: 'boolean', description: 'type：输入前后各按一次回车（用于确认对话框）。' },
+    verify: { type: 'boolean', description: 'true = 自动前后截图对比，返回 verified/hash，用来确认操作真的生效。' },
+  },
+}
+
+/**
+ * `vesta_input`：向 VESTA 的 3D 视图注入鼠标/键盘（等价于直接操作）。
+ * @param {object} ctx - 插件上下文。
+ * @returns {object} 工具定义。
+ */
+const inputTool = (ctx) => localTool({
+  name: 'vesta_input',
+  description:
+    '直接操作 VESTA 的 3D 视图，等价于用鼠标键盘：拖拽旋转（drag）、滚轮缩放（wheel）、方向键旋转（key）、'
+    + '在视图里点击（click）、向对话框打字（type）。当用户说「转一下/换个角度/放大缩小/点一下/把视图摆正」时用它；'
+    + '支持 undo/redo：拖拽、滚轮、按键都可以精确撤销（实测反向操作能回到逐字节相同的画面）。'
+    + '给 verify=true 会前后截图对比，确认这次操作真的改变了画面。它是 Win32 消息注入，不需要窗口在前台。',
+  parameters: INPUT_PARAMS,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['ok', 'summary', 'action', 'ms'],
+      properties: {
+        ok: { type: 'boolean' },
+        summary: { type: 'string' },
+        action: { type: 'string' },
+        pid: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+        client: { type: 'string' },
+        ms: { type: 'integer' },
+        verified: { oneOf: [{ type: 'boolean' }, { type: 'null' }] },
+        beforeHash: { type: 'string' },
+        afterHash: { type: 'string' },
+      },
+    },
+    render: (_args, value) => [{ type: 'text', text: value.summary }],
+  },
+  presentCall: (args) => ({ card: 'generic', title: 'VESTA input', kind: 'execute', rawInput: { action: args.action } }),
+  async execute(args, exec) {
+    const core = await import(`./core.js?rev=${Date.now()}`)
+    const base = sessionDirectory(ctx, exec)
+    const target = Number.isInteger(args.pid) ? { pid: args.pid } : 'main'
+    const action = String(args.action)
+
+    // 可选：操作前后各截一张图，用哈希判断画面是否真的变了
+    let beforeHash = ''
+    let beforePath = ''
+    if (args.verify) {
+      beforePath = core.toAbsolute(`.dsh-vesta-input-${Date.now()}-before.png`, base)
+      const shot = await core.captureWindow({
+        ...(Number.isInteger(args.pid) ? { pid: args.pid } : { window: 'main' }),
+        out: beforePath,
+      })
+      beforeHash = core.hashFile(shot.path)
+    }
+
+    if (action === 'undo' || action === 'redo') {
+      const outcome = action === 'undo' ? await core.undoInput(target) : await core.redoInput(target)
+      const moved = action === 'undo' ? outcome.undone : outcome.redone
+      const history = core.getInputHistory(Number.isInteger(args.pid) ? args.pid : 0)
+      if (!moved) {
+        return {
+          ok: true,
+          summary: action === 'undo' ? '没有可撤销的视图操作（只记录拖拽/滚轮/按键）' : '没有可重做的操作',
+          action,
+          pid: Number.isInteger(args.pid) ? args.pid : null,
+          client: '',
+          ms: 0,
+          verified: null,
+          beforeHash: '',
+          afterHash: '',
+        }
+      }
+      return {
+        ok: true,
+        summary: (action === 'undo' ? '已撤销 ' : '已重做 ')
+          + moved.action + JSON.stringify(moved.options)
+          + '（剩余可撤销 ' + history.undo.length + ' 步，可重做 ' + history.redo.length + ' 步）',
+        action,
+        pid: Number.isInteger(args.pid) ? args.pid : null,
+        client: '',
+        ms: 0,
+        verified: null,
+        beforeHash: '',
+        afterHash: '',
+      }
+    }
+
+    const result = await core.injectInput(target, action, {
+      dx: args.dx, dy: args.dy, x: args.x, y: args.y,
+      delta: args.delta, count: args.count, key: args.key, ctrl: args.ctrl,
+      text: args.text, enter: args.enter,
+    })
+
+    let afterHash = ''
+    let verified = null
+    if (args.verify) {
+      const afterPath = core.toAbsolute(`.dsh-vesta-input-${Date.now()}-after.png`, base)
+      const shot = await core.captureWindow({
+        ...(Number.isInteger(args.pid) ? { pid: args.pid } : { window: 'main' }),
+        out: afterPath,
+      })
+      afterHash = core.hashFile(shot.path)
+      verified = beforeHash !== afterHash
+    }
+
+    const describe = {
+      drag: `拖拽 ${result.from?.x},${result.from?.y} → ${result.to?.x},${result.to?.y}`,
+      wheel: `滚轮 ${result.delta} × ${result.count}`,
+      key: `按键 vk=${result.vk} × ${result.count}${result.ctrl ? '（Ctrl）' : ''}`,
+      click: `点击 ${result.at?.x},${result.at?.y}`,
+      type: `输入 ${result.typed} 个字符${result.enter ? '（带回车）' : ''}`,
+    }[action] ?? action
+
+    const verifiedText = verified === null ? '' : (verified ? '，画面已变化 ✓' : '，画面未变化（可能已到边界或该动作无视觉影响）')
+    return {
+      ok: true,
+      summary: `${describe}（视图 ${result.client ?? '未知'}，耗时 ${result.ms} ms）${verifiedText}`,
+      action,
+      pid: result.pid ?? null,
+      client: result.client ?? '',
+      ms: result.ms ?? 0,
+      verified,
+      beforeHash,
+      afterHash,
+    }
+  },
+})
+
+// ---------------------------------------------------------------------------
+// CLI 批量出图（.vesta 模板 + -rotate_* + -export_img，见 docs/VESTA.md）
+// ---------------------------------------------------------------------------
+
+const RENDER_PARAMS = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['path'],
+  properties: {
+    path: { type: 'string', description: '结构/体积文件（POSCAR、CIF、CUBE…），或含结构的任务目录。' },
+    outDir: { type: 'string', description: '输出目录；省略则写 <结构所在目录>/vesta-render。' },
+    scale: { type: 'integer', description: '放大倍数（1–6），默认 2；scale=2 时 706×553 的窗口导出 1412×1106。' },
+    template: { type: 'string', description: '场景模板 .vesta 路径：给了就先用模板的显示设置包住该结构，再出图（批量风格一致）。' },
+    background: {
+      type: 'array',
+      description: '背景色 [r,g,b]（0–255）。实测 VESTA 认场景文件里的 BKGRC（渲染后角落像素会变）。',
+      items: { type: 'integer' },
+    },
+    model: { type: 'integer', description: '显示模型：0=球棍（默认）、1=空间填充。实测 VESTA 认 STYLE 的 MODEL 字段。' },
+    boundary: {
+      type: 'array',
+      description: '显示边界：三个方向各一对 [起, 止]，如 [[-1,2],[-1,2],[-1,2]] 显示 3×3×3 个晶胞。只对给了 template 的场景生效。',
+      items: { type: 'array', items: { type: 'integer' } },
+    },
+    views: {
+      type: 'array',
+      description: '视角列表；每项 {name, rx, ry, rz, scale}。省略则只出默认视角一张。',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          name: { type: 'string', description: '文件名（不含扩展名）。' },
+          rx: { type: 'number', description: '绕 x 轴旋转角度（度）。' },
+          ry: { type: 'number', description: '绕 y 轴旋转角度（度）。' },
+          rz: { type: 'number', description: '绕 z 轴旋转角度（度）。' },
+          scale: { type: 'integer', description: '该视角的放大倍数（覆盖全局 scale）。' },
+        },
+      },
+    },
+  },
+}
+
+/**
+ * `vesta_render`：用 VESTA 命令行批量出图（不用 GUI 交互），每张图可追溯。
+ * @param {object} ctx - 插件上下文。
+ * @returns {object} 工具定义。
+ */
+const renderTool = (merged, ctx) => localTool({
+  name: 'vesta_render',
+  description:
+    '用 VESTA 的命令行接口批量出图：同一结构、同一套渲染设置，只换视角（-rotate_x/y/z）与放大倍数（-export_img scale=N），'
+    + '跑完写一份 manifest.json（输入文件 sha256、参数、输出、大小、耗时），保证每张图可追溯。'
+    + '当用户要「批量出图 / 统一风格的图 / 高分辨率导出 / 多角度看同一个结构」时用它；不需要打开 GUI、不需要点菜单。',
+  parameters: RENDER_PARAMS,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['ok', 'summary', 'outDir', 'manifest', 'renders'],
+      properties: {
+        ok: { type: 'boolean' },
+        summary: { type: 'string' },
+        outDir: { type: 'string' },
+        manifest: { type: 'string' },
+        renders: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['name', 'out', 'bytes', 'ms'],
+            properties: {
+              name: { type: 'string' },
+              out: { type: 'string' },
+              bytes: { type: 'integer' },
+              ms: { type: 'integer' },
+            },
+          },
+        },
+      },
+    },
+    render: (_args, value) => [{ type: 'text', text: value.summary }],
+  },
+  presentCall: (args) => ({ card: 'generic', title: 'Render with VESTA CLI', kind: 'execute', rawInput: { path: args.path } }),
+  async execute(args, exec) {
+    const core = await import(`./core.js?rev=${Date.now()}`)
+    const base = sessionDirectory(ctx, exec)
+    const target = core.resolveTarget(args.path, base)
+    const result = await core.renderViewsWithCli(merged, {
+      structure: target,
+      outDir: args.outDir ? core.toAbsolute(args.outDir, base) : undefined,
+      scale: args.scale,
+      template: args.template ? core.toAbsolute(args.template, base) : undefined,
+      sceneStyle: (args.background || args.model !== undefined || args.boundary)
+        ? { background: args.background, model: args.model, boundary: args.boundary } : undefined,
+      views: args.views,
+    })
+    const lines = result.renders.map((item) => {
+      const angles = [item.view.rx ? 'rx=' + item.view.rx : '', item.view.ry ? 'ry=' + item.view.ry : '', item.view.rz ? 'rz=' + item.view.rz : '']
+        .filter(Boolean).join(' ')
+      return `  ${item.name}.png（${Math.round(item.bytes / 1024)} KB，scale=${item.scale}${angles ? '，' + angles : ''}，${item.ms} ms）`
+    })
+    return {
+      ok: true,
+      summary: `VESTA CLI 批量出图：${result.renders.length} 张，输出目录 ${result.outDir}`
+    + (args.template ? `\n模板：${args.template}` : '')
+    + `\n${lines.join('\n')}\n清单：${result.manifest}`,
+      outDir: result.outDir,
+      manifest: result.manifest,
+      renders: result.renders.map((item) => ({ name: item.name, out: item.out, bytes: item.bytes, ms: item.ms })),
+    }
+  },
+})
+
+// ---------------------------------------------------------------------------
+// 结构编辑（替代 VESTA 的 Edit Data 对话框：扩胞、任意整数矩阵、元素替换）
+// ---------------------------------------------------------------------------
+
+const EDIT_PARAMS = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['path'],
+  properties: {
+    path: { type: 'string', description: '输入结构：POSCAR/CONTCAR 或 CIF，或包含它的任务目录。' },
+    repeat: {
+      type: 'array',
+      description: '扩胞倍数 [nx, ny, nz]（正整数），等价于 P = diag(nx,ny,nz)。',
+      items: { type: 'integer' },
+    },
+    matrix: {
+      type: 'array',
+      description: '任意 3×3 整数变换矩阵（VESTA 的 Rotation matrix (P)：新基矢 = P·旧基矢）。',
+      items: { type: 'array', items: { type: 'integer' } },
+    },
+    substitute: {
+      type: 'object',
+      description: '同位置换元素，例如 {from:"Si", to:"C"}。',
+      additionalProperties: false,
+      required: ['from', 'to'],
+      properties: {
+        from: { type: 'string', description: '被替换的元素符号。' },
+        to: { type: 'string', description: '替换成的新元素符号。' },
+      },
+    },
+    cell: {
+      type: 'object',
+      description: '修改晶胞参数（只给要改的项）：{a,b,c,alpha,beta,gamma}，长度 Å、角度度。',
+      additionalProperties: false,
+      properties: {
+        a: { type: 'number', description: 'a 轴长度（Å）。' },
+        b: { type: 'number', description: 'b 轴长度（Å）。' },
+        c: { type: 'number', description: 'c 轴长度（Å）。' },
+        alpha: { type: 'number', description: 'α 角（度）。' },
+        beta: { type: 'number', description: 'β 角（度）。' },
+        gamma: { type: 'number', description: 'γ 角（度）。' },
+      },
+    },
+    add: {
+      type: 'array',
+      description: '追加原子：[{symbol:"C", frac:[x,y,z]}]，分数坐标会自动折回 [0,1)。',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['symbol', 'frac'],
+        properties: {
+          symbol: { type: 'string', description: '元素符号。' },
+          frac: { type: 'array', items: { type: 'number' }, description: '分数坐标 [x,y,z]。' },
+        },
+      },
+    },
+    remove: {
+      type: 'object',
+      description: '删除原子：按索引（0 基）或按元素。',
+      additionalProperties: false,
+      properties: {
+        indexes: { type: 'array', items: { type: 'integer' }, description: '要删除的原子索引（0 基）。' },
+        species: { type: 'string', description: '要删除的元素符号（删除该元素全部原子）。' },
+      },
+    },
+    refineCell: {
+      type: 'boolean',
+      description: '配合 symmetrize 使用：同时把晶胞投射到该空间群的对称约束上（度规张量最小二乘投影），默认 false。',
+    },
+    symmetrize: {
+      type: 'integer',
+      description: '按空间群编号做对称化（把近似满足该群的结构投射到严格对称位置），1–230。',
+      minimum: 1,
+      maximum: 230,
+    },
+    reduceSpaceGroup: {
+      type: 'integer',
+      description: '按空间群编号把完整晶胞约化为不对称单元（与 spaceGroup 互逆），并给出每个轨道的多重度。',
+      minimum: 1,
+      maximum: 230,
+    },
+    spaceGroup: {
+      type: 'integer',
+      description: '按空间群编号（1–230）把当前结构当作不对称单元展开成完整晶胞（等价于 VESTA 的 Apply symmetry operations）。',
+      minimum: 1,
+      maximum: 230,
+    },
+    out: { type: 'string', description: '输出路径；扩展名 .cif 写 CIF，其余写 POSCAR。省略则写在输入同目录，文件名带变换后缀。' },
+    open: { type: 'boolean', description: 'true = 生成后立刻在 VESTA 里打开（返回 pid）。' },
+  },
+}
+
+/**
+ * `vesta_edit`：结构编辑（扩胞 / 变换矩阵 / 元素替换），不依赖 VESTA 的对话框。
+ * @param {object} merged - 配置。
+ * @param {object} ctx - 插件上下文。
+ * @returns {object} 工具定义。
+ */
+const editTool = (merged, ctx) => localTool({
+  name: 'vesta_edit',
+  description:
+    '直接编辑晶体结构并写出新的 POSCAR：扩胞（repeat=[2,2,1]）、任意整数变换矩阵（matrix，语义同 VESTA 的 Unit Cell Transformation）、'
+    + '同位置换元素（substitute）。当用户说「扩胞 / 超胞 / 换成 2×2×1 / 把 Si 换成 C」时用它；'
+    + '它自己算原子，不依赖 VESTA 的对话框（VESTA 的 wx 对话框无法被外部消息驱动）。',
+  parameters: EDIT_PARAMS,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['ok', 'summary', 'out', 'atoms', 'cell'],
+      properties: {
+        ok: { type: 'boolean' },
+        summary: { type: 'string' },
+        out: { type: 'string' },
+        atoms: { type: 'integer' },
+        cell: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['a', 'b', 'c', 'alpha', 'beta', 'gamma'],
+          properties: {
+            a: { type: 'number' }, b: { type: 'number' }, c: { type: 'number' },
+            alpha: { type: 'number' }, beta: { type: 'number' }, gamma: { type: 'number' },
+          },
+        },
+        elements: { type: 'array', items: { type: 'string' } },
+        pid: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+      },
+    },
+    render: (_args, value) => [{ type: 'text', text: value.summary }],
+  },
+  presentCall: (args) => ({ card: 'generic', title: 'Edit structure', kind: 'execute', rawInput: { path: args.path } }),
+  async execute(args, exec) {
+    const core = await import(`./core.js?rev=${Date.now()}`)
+    const base = sessionDirectory(ctx, exec)
+    const input = core.resolveTarget(args.path, base)
+    const { readFileSync: readText, writeFileSync: writeText } = await import('node:fs')
+    const rawText = readText(input, 'utf8')
+    // 记录实际做了哪些编辑（CIF 回退转换也会写进来，所以先声明）
+    const applied = []
+    // 输入可以是 POSCAR 也可以是 CIF（CIF 用自带对称操作或回退 spgra.dat 展开）
+    let structure
+    if (/\.cif$/i.test(input)) {
+      // CIF 自带 _space_group_symop_operation_xyz 就自己展开；没有的话交给 VESTA 转一次更稳：
+      // spgra.dat 里有些群只存了一半操作（如 P21/c 只有 2 条，完整群有 4 条），自己展开会少一半原子
+      const parsedCif = core.parseCif(rawText)
+      if (parsedCif.ops.length > 0) {
+        const fromCif = core.structureFromCif(rawText)
+        structure = { a1: fromCif.a1, a2: fromCif.a2, a3: fromCif.a3, atoms: fromCif.atoms }
+      } else {
+        const { mkdtempSync } = await import('node:fs')
+        const { tmpdir } = await import('node:os')
+        const { join: joinPath } = await import('node:path')
+        const tempDir = mkdtempSync(joinPath(tmpdir(), 'dsh-cif-'))
+        const tempPoscar = joinPath(tempDir, 'converted.vasp')
+        await core.convertWithVesta(merged, input, tempPoscar, { timeoutMs: 90000 })
+        const parsedPoscar = core.parsePoscar(readText(tempPoscar, 'utf8'), tempPoscar)
+        structure = {
+          a1: parsedPoscar.a1, a2: parsedPoscar.a2, a3: parsedPoscar.a3,
+          atoms: parsedPoscar.atoms.map((atom) => ({ symbol: atom.symbol, frac: atom.frac })),
+        }
+        applied.push('CIF 无自带对称操作，已用 VESTA 转换')
+      }
+    } else {
+      const parsed = core.parsePoscar(rawText, input)
+      structure = {
+        a1: parsed.a1, a2: parsed.a2, a3: parsed.a3,
+        atoms: parsed.atoms.map((atom) => ({ symbol: atom.symbol, frac: atom.frac })),
+      }
+    }
+
+    if (Array.isArray(args.repeat)) {
+      if (args.repeat.length !== 3) throw new Error('repeat 必须是三个正整数')
+      structure = core.makeSupercell(structure, args.repeat)
+      applied.push('扩胞 ' + args.repeat.join('×'))
+    }
+    if (args.cell) {
+      const changed = core.setCellParameters(structure, args.cell)
+      structure = changed.structure
+      applied.push('晶胞 ' + Object.entries(args.cell).map(([key, value]) => key + '=' + value).join(' '))
+    }
+    let matrixDet = null
+    if (Array.isArray(args.matrix)) {
+      const transformed = core.transformStructure(structure, args.matrix)
+      matrixDet = transformed.determinant
+      structure = { a1: transformed.a1, a2: transformed.a2, a3: transformed.a3, atoms: transformed.atoms }
+      applied.push('矩阵 det=' + transformed.determinant)
+    }
+    if (Number.isInteger(args.spaceGroup)) {
+      const { dirname } = await import('node:path')
+      const tablePath = core.toAbsolute('spgra.dat', dirname(String(merged.executable ?? '')))
+      const expanded = core.expandBySpaceGroup(structure, args.spaceGroup, tablePath)
+      structure = expanded.structure
+      applied.push('空间群 ' + args.spaceGroup + ' ' + expanded.symbol + ' → ' + expanded.unique + ' 原子')
+    }
+    if (Number.isInteger(args.reduceSpaceGroup)) {
+      const { dirname } = await import('node:path')
+      const tablePath = core.toAbsolute('spgra.dat', dirname(String(merged.executable ?? '')))
+      const reduced = core.reduceBySpaceGroup(structure, args.reduceSpaceGroup, tablePath)
+      structure = reduced.structure
+      // Wyckoff 字母：同一个 VESTA 安装目录下的 wyckoff.dat
+      let letters = []
+      try {
+        const wyckoffPath = core.toAbsolute('wyckoff.dat', dirname(String(merged.executable ?? '')))
+        const wyckoffTable = core.loadWyckoffTable(wyckoffPath)
+        letters = core.assignWyckoff(structure, args.reduceSpaceGroup, wyckoffTable, null)
+      } catch {
+        letters = []
+      }
+      const letterText = letters.length > 0
+        ? letters.map((item) => item.symbol + ' ' + (item.ok ? item.letter + '(' + item.multiplicity + ')' : '?')).join(', ')
+        : reduced.orbits.map((orbit) => orbit.multiplicity).join('/')
+      applied.push('约化 空间群 ' + args.reduceSpaceGroup + ' ' + reduced.symbol
+        + ' → ' + reduced.structure.atoms.length + ' 原子（' + letterText + '）')
+    }
+    if (Number.isInteger(args.symmetrize)) {
+      const { dirname: dirOfSym } = await import('node:path')
+      const tablePath = core.toAbsolute('spgra.dat', dirOfSym(String(merged.executable ?? '')))
+      const table = core.loadSpaceGroupTable(tablePath)
+      // 先按需对称化晶胞（度规张量投影），再整理原子位置
+      if (args.refineCell) {
+        const cellResult = core.symmetrizeCell(structure, args.symmetrize, table)
+        structure = cellResult.structure
+        applied.push('对称化晶胞 a=' + cellResult.after.a.toFixed(4) + ' b=' + cellResult.after.b.toFixed(4)
+          + ' c=' + cellResult.after.c.toFixed(4) + '（偏差 ' + cellResult.deviation.toExponential(1) + '）')
+      }
+      const result = core.symmetrizeStructure(structure, args.symmetrize, table)
+      structure = result.structure
+      applied.push('对称化 空间群 ' + args.symmetrize + '（最大位移 '
+        + result.maxShift.toFixed(4) + ' 分数坐标，迭代 ' + result.iterations + ' 轮）')
+    }
+    if (args.substitute) {
+      const result = core.substituteElement(structure, args.substitute.from, args.substitute.to)
+      structure = result.structure
+      applied.push('替换 ' + args.substitute.from + '→' + args.substitute.to + ' ×' + result.replaced)
+    }
+    if (Array.isArray(args.add)) {
+      const added = core.addAtoms(structure, args.add)
+      structure = added.structure
+      applied.push('加原子 ×' + added.added)
+    }
+    if (args.remove) {
+      const removed = core.removeAtoms(structure, args.remove)
+      structure = removed.structure
+      applied.push('删原子 ×' + removed.removed)
+    }
+    // 只给 out、不给任何编辑动作时允许「纯格式转换」（例如 CIF → POSCAR）
+    const convertOnly = applied.length === 0 && args.out
+    if (applied.length === 0 && !convertOnly) throw new Error('至少给一个编辑操作：repeat / matrix / cell / spaceGroup / substitute / add / remove')
+
+    const params = core.cellParameters([structure.a1, structure.a2, structure.a3])
+    // VESTA 按文件名/扩展名判断类型：`.POSCAR` 会被拒绝（Invalid data!），必须用 `.vasp` 或裸文件名；
+    // 文件名里也不要用中文与 ×，否则部分版本会解析失败
+    const asciiOps = [
+      Array.isArray(args.repeat) ? args.repeat.join('x') : '',
+      Array.isArray(args.matrix) ? 'det' + String(matrixDet ?? '') : '',
+      Number.isInteger(args.spaceGroup) ? 'sg' + args.spaceGroup : '',
+      Number.isInteger(args.reduceSpaceGroup) ? 'red' + args.reduceSpaceGroup : '',
+      Number.isInteger(args.symmetrize) ? 'sym' + args.symmetrize : '',
+      args.substitute ? 'sub-' + args.substitute.from + '2' + args.substitute.to : '',
+    ].filter(Boolean).join('_')
+    const suffix = asciiOps.replace(/[^0-9a-zA-Zx_.-]+/g, '-').slice(0, 40) || 'edited'
+    const out = core.toAbsolute(args.out ?? `${input.replace(/\.(vasp|poscar|contcar)$/i, '')}-${suffix}.vasp`, base)
+    // 按扩展名选写出格式：.cif → CIF；其余（默认 .vasp）→ POSCAR
+    const text = /\.cif$/i.test(out)
+      ? core.structureToCif(structure, { title: applied.join(' ') || 'structure' })
+      : core.structureToPoscar(structure, applied.join('; '))
+    writeText(out, text, 'utf8')
+
+    let pid = null
+    if (args.open) {
+      const opened = await core.openFiles(merged, [out], base)
+      pid = opened.files?.[0]?.pid ?? null
+    }
+    const elements = [...new Set(structure.atoms.map((atom) => atom.symbol))]
+    // POSCAR 没有占位率字段：写 POSCAR 时部分占位的原子会变成满占位，要在摘要里说明
+    const partialOccupancy = structure.atoms.filter(
+      (atom) => typeof atom.occupancy === 'number' && Number.isFinite(atom.occupancy) && atom.occupancy < 0.999,
+    ).length
+    const occupancyNote = partialOccupancy > 0 && !/\.cif$/i.test(out)
+      ? `\n注意：有 ${partialOccupancy} 个原子是部分占位，POSCAR 不支持占位率，写出时已按满占位处理（写 .cif 可保留）`
+      : ''
+    return {
+      ok: true,
+      summary: `已${applied.length > 0 ? '编辑结构（' + applied.join('，') + '）' : '转换格式'}：${structure.atoms.length} 个原子（${elements.join('/')}），`
+        + `晶胞 a=${params.a.toFixed(3)} b=${params.b.toFixed(3)} c=${params.c.toFixed(3)} Å\n输出：${out}`
+        + occupancyNote
+        + (pid ? `\n已在 VESTA 打开（pid ${pid}）` : ''),
+      out,
+      atoms: structure.atoms.length,
+      cell: {
+        a: params.a, b: params.b, c: params.c,
+        alpha: params.alpha, beta: params.beta, gamma: params.gamma,
+      },
+      elements,
+      pid,
+    }
+  },
+})
+
+// ---------------------------------------------------------------------------
+// 矢量图导出（SVG）：VESTA 只有 GUI 的「Export Vector Image」，这里用结构数据直接渲染
+// ---------------------------------------------------------------------------
+
+const VECTOR_PARAMS = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['path'],
+  properties: {
+    path: { type: 'string', description: '结构文件（POSCAR/CONTCAR/CIF）或包含它的任务目录。' },
+    out: { type: 'string', description: '输出 SVG 路径；省略则写在输入同目录，文件名 <结构名>-vector.svg。' },
+    width: { type: 'integer', description: '画布宽（像素），默认 800。' },
+    height: { type: 'integer', description: '画布高（像素），默认 600。' },
+    rx: { type: 'number', description: '绕 x 轴旋转（度），默认 0。' },
+    ry: { type: 'number', description: '绕 y 轴旋转（度），默认 0。' },
+    rz: { type: 'number', description: '绕 z 轴旋转（度），默认 0。' },
+    showCell: { type: 'boolean', description: '是否画晶胞边框，默认 true。' },
+    showBonds: { type: 'boolean', description: '是否画化学键，默认 true。' },
+    background: { type: 'string', description: '背景色（CSS 颜色），默认 #ffffff。' },
+  },
+}
+
+/**
+ * `vesta_vector`：把结构导出为 SVG 矢量图。
+ * @param {object} ctx - 插件上下文。
+ * @returns {object} 工具定义。
+ */
+const vectorTool = (ctx) => localTool({
+  name: 'vesta_vector',
+  description:
+    '把晶体结构导出成 SVG 矢量图（正交投影 + 球棍 + 晶胞边框）：坐标是真实几何算出来的，'
+    + '所以可以无限放大、可被 Illustrator/Inkscape 编辑。当用户要「矢量图 / 投稿插图 / 可编辑的图」时用它；'
+    + '它是 VESTA 的 Export Vector Image 的等价实现（VESTA 没有矢量导出的命令行）。',
+  parameters: VECTOR_PARAMS,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['ok', 'summary', 'out', 'atoms', 'bonds', 'width', 'height'],
+      properties: {
+        ok: { type: 'boolean' },
+        summary: { type: 'string' },
+        out: { type: 'string' },
+        atoms: { type: 'integer' },
+        bonds: { type: 'integer' },
+        width: { type: 'integer' },
+        height: { type: 'integer' },
+      },
+    },
+    render: (_args, value) => [{ type: 'text', text: value.summary }],
+  },
+  presentCall: (args) => ({ card: 'generic', title: 'Export SVG', kind: 'execute', rawInput: { path: args.path } }),
+  async execute(args, exec) {
+    const core = await import(`./core.js?rev=${Date.now()}`)
+    const { readFileSync: readText, writeFileSync: writeText } = await import('node:fs')
+    const base = sessionDirectory(ctx, exec)
+    const input = core.resolveTarget(args.path, base)
+    const rawText = readText(input, 'utf8')
+    // 支持 POSCAR 与 CIF：CIF 带占位率，SVG 里会按占位率调透明度
+    let structure
+    if (/\.cif$/i.test(input)) {
+      const fromCif = core.structureFromCif(rawText)
+      structure = { a1: fromCif.a1, a2: fromCif.a2, a3: fromCif.a3, atoms: fromCif.atoms }
+    } else {
+      const parsed = core.parsePoscar(rawText, input)
+      structure = {
+        a1: parsed.a1, a2: parsed.a2, a3: parsed.a3,
+        atoms: parsed.atoms.map((atom) => ({ symbol: atom.symbol, frac: atom.frac })),
+      }
+    }
+    const rendered = core.structureToSvg(structure, {
+      width: args.width, height: args.height,
+      rx: args.rx, ry: args.ry, rz: args.rz,
+      showCell: args.showCell, showBonds: args.showBonds, background: args.background,
+    })
+    const out = core.toAbsolute(args.out ?? `${input.replace(/\.(vasp|poscar|contcar)$/i, '')}-vector.svg`, base)
+    writeText(out, rendered.svg, 'utf8')
+    return {
+      ok: true,
+      summary: `已导出 SVG 矢量图：${rendered.atoms} 个原子、${rendered.bonds} 条键、`
+        + (rendered.partial ? `${rendered.partial} 个部分占位（按占位率调了透明度）、` : '')
+        + `${rendered.width}×${rendered.height} 像素画布\n${out}`,
+      out,
+      atoms: rendered.atoms,
+      bonds: rendered.bonds,
+      width: rendered.width,
+      height: rendered.height,
+    }
+  },
+})
+
+// ---------------------------------------------------------------------------
+// 体数据导出（切片 CSV / 线剖面 TXT）：VESTA 的 Export Data 数据侧等价物
+// ---------------------------------------------------------------------------
+
+const VOLUME_EXPORT_PARAMS = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['path'],
+  properties: {
+    path: { type: 'string', description: '体积文件（CHGCAR/CHG/PARCHG/ELFCAR/LOCPOT/.cube），或含它的任务目录。' },
+    kind: {
+      type: 'string',
+      enum: ['slice', 'profile'],
+      description: 'slice=二维切片导出 CSV；profile=沿线段取样导出 TXT。默认 slice。',
+    },
+    plane: { type: 'string', enum: ['xy', 'yz', 'zx'], description: 'slice 用：切面方向，默认 xy。' },
+    at: { type: 'number', description: 'slice 用：切面位置（分数坐标 0–1），默认 0.5。' },
+    from: { type: 'string', description: 'profile 用：起点分数坐标 "x,y,z"，默认 "0,0,0"。' },
+    to: { type: 'string', description: 'profile 用：终点分数坐标，默认 "0.5,0.5,0.5"。' },
+    points: { type: 'integer', description: 'profile 用：采样点数，默认 50。' },
+    out: { type: 'string', description: '输出路径（.csv 或 .txt）；省略则写在体积文件同目录。' },
+  },
+}
+
+/**
+ * `volume_export`：把体数据的切片或线剖面导成文本。
+ * @param {object} ctx - 插件上下文。
+ * @returns {object} 工具定义。
+ */
+const volumeExportTool = (ctx) => localTool({
+  name: 'volume_export',
+  description:
+    '把体积数据（CHGCAR/CHG/LOCPOT/ELFCAR/.cube）导出成文本：slice 导出某个切面的 CSV（48×48 网格逐点数值），'
+    + 'profile 导出一条线剖面的 TXT（距离 + 数值）。当用户要「把电荷密度数据导出来 / 切片数据 / 剖面数据」时用它；'
+    + '这是 VESTA 的 Export Data 在数据侧的等价物（GUI 对话框不可驱动）。',
+  parameters: VOLUME_EXPORT_PARAMS,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['ok', 'summary', 'out', 'kind', 'points'],
+      properties: {
+        ok: { type: 'boolean' },
+        summary: { type: 'string' },
+        out: { type: 'string' },
+        kind: { type: 'string' },
+        points: { type: 'integer' },
+        dims: { type: 'array', items: { type: 'integer' } },
+        unit: { type: 'string' },
+      },
+    },
+    render: (_args, value) => [{ type: 'text', text: value.summary }],
+  },
+  presentCall: (args) => ({ card: 'generic', title: 'Export volume data', kind: 'export', rawInput: { path: args.path } }),
+  async execute(args, exec) {
+    const core = await import(`./core.js?rev=${Date.now()}`)
+    const { readFileSync: readText, writeFileSync: writeText } = await import('node:fs')
+    const { dirname } = await import('node:path')
+    const base = sessionDirectory(ctx, exec)
+    const input = core.resolveTarget(args.path, base)
+    const volume = core.readVolumeFile(input)
+    const kind = args.kind === 'profile' ? 'profile' : 'slice'
+    const parsePoint = (raw, fallback) => {
+      if (typeof raw !== 'string' || raw.trim() === '') return fallback
+      const parts = raw.split(',').map(Number)
+      if (parts.length !== 3 || parts.some((value) => !Number.isFinite(value))) {
+        throw new Error('坐标要写成 "x,y,z" 三个数字：' + raw)
+      }
+      return parts
+    }
+    if (kind === 'slice') {
+      const csv = core.volumeSliceCsv(volume, { plane: args.plane, at: args.at })
+      const slice = core.volumeSlice(volume, { plane: args.plane, at: args.at })
+      const out = core.toAbsolute(args.out ?? `${input.replace(/\.[^.]+$/, '')}-slice-${slice.plane}.csv`, base)
+      writeText(out, csv, 'utf8')
+      return {
+        ok: true,
+        summary: `切片导出：${slice.plane} 面（${slice.axisLabels[2]}）${slice.rows}×${slice.columns} 网格，单位 ${volume.unit ?? '未知'}\n${out}`,
+        out,
+        kind,
+        points: slice.rows * slice.columns,
+        dims: volume.dims,
+        unit: volume.unit ?? '',
+      }
+    }
+    const from = parsePoint(args.from, [0, 0, 0])
+    const to = parsePoint(args.to, [0.5, 0.5, 0.5])
+    const text = core.volumeProfileText(volume, { from, to, points: args.points })
+    const out = core.toAbsolute(args.out ?? `${input.replace(/\.[^.]+$/, '')}-profile.txt`, base)
+    writeText(out, text, 'utf8')
+    const sampleCount = text.split('\n').filter((line) => line && !line.startsWith('#')).length
+    return {
+      ok: true,
+      summary: `线剖面导出：${from.join(',')} → ${to.join(',')}，${sampleCount} 个采样点，单位 ${volume.unit ?? '未知'}\n${out}`,
+      out,
+      kind,
+      points: sampleCount,
+      dims: volume.dims,
+      unit: volume.unit ?? '',
+    }
+  },
+})
+
+// ---------------------------------------------------------------------------
+// 测量（距离/角度 + 点击拾取）：VESTA 里靠点两个原子完成，这里用投影+索引算
+// ---------------------------------------------------------------------------
+
+const MEASURE_PARAMS = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['path'],
+  properties: {
+    path: { type: 'string', description: '结构文件（POSCAR/CONTCAR）或任务目录。' },
+    distance: {
+      type: 'array',
+      description: '要量的原子对：[[i,j]]，索引从 0 开始（与 POSCAR 中原子顺序一致）。',
+      items: { type: 'array', items: { type: 'integer' } },
+    },
+    angle: {
+      type: 'array',
+      description: '要量的角度：[[i,j,k]]，j 是顶点。',
+      items: { type: 'array', items: { type: 'integer' } },
+    },
+    clicks: {
+      type: 'array',
+      description: '点击拾取：画布坐标 [{x,y}]，配合 view 使用；命中后与上一个点组成距离。',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['x', 'y'],
+        properties: {
+          x: { type: 'number', description: '画布 X（像素）。' },
+          y: { type: 'number', description: '画布 Y（像素）。' },
+        },
+      },
+    },
+    view: {
+      type: 'object',
+      description: 'clicks 用的投影参数（与 vesta_vector 相同的 rx/ry/rz/width/height）。',
+      additionalProperties: false,
+      properties: {
+        rx: { type: 'number', description: '绕 x 轴旋转（度）。' },
+        ry: { type: 'number', description: '绕 y 轴旋转（度）。' },
+        rz: { type: 'number', description: '绕 z 轴旋转（度）。' },
+        width: { type: 'integer', description: '画布宽（像素）。' },
+        height: { type: 'integer', description: '画布高（像素）。' },
+      },
+    },
+  },
+}
+
+/**
+ * `vesta_measure`：量原子间距离/角度，或把画布点击映射成原子并测量。
+ * @param {object} ctx - 插件上下文。
+ * @returns {object} 工具定义。
+ */
+const measureTool = (ctx) => localTool({
+  name: 'vesta_measure',
+  description:
+    '测量晶体结构里的键长与键角：给原子索引（distance=[[i,j]]、angle=[[i,j,k]]）直接算，'
+    + '或用 clicks 给画布坐标（配合 view 的 rx/ry/rz 与 width/height）先拾取原子再算——相当于 VESTA 里点两个原子量距离。'
+    + '当用户问「这两根键多长 / 这个角多少度 / 帮我量一下」时用它。',
+  parameters: MEASURE_PARAMS,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['ok', 'summary', 'distances', 'angles'],
+      properties: {
+        ok: { type: 'boolean' },
+        summary: { type: 'string' },
+        distances: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['i', 'j', 'distance'],
+            properties: {
+              i: { type: 'integer' }, j: { type: 'integer' }, distance: { type: 'number' },
+            },
+          },
+        },
+        angles: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['i', 'j', 'k', 'angle'],
+            properties: {
+              i: { type: 'integer' }, j: { type: 'integer' }, k: { type: 'integer' }, angle: { type: 'number' },
+            },
+          },
+        },
+        picked: { type: 'array', items: { type: 'integer' } },
+      },
+    },
+    render: (_args, value) => [{ type: 'text', text: value.summary }],
+  },
+  presentCall: (args) => ({ card: 'generic', title: 'Measure', kind: 'read', rawInput: { path: args.path } }),
+  async execute(args, exec) {
+    const core = await import(`./core.js?rev=${Date.now()}`)
+    const { readFileSync: readText } = await import('node:fs')
+    const base = sessionDirectory(ctx, exec)
+    const input = core.resolveTarget(args.path, base)
+    const parsed = core.parsePoscar(readText(input, 'utf8'), input)
+    const structure = {
+      a1: parsed.a1, a2: parsed.a2, a3: parsed.a3,
+      atoms: parsed.atoms.map((atom) => ({ symbol: atom.symbol, frac: atom.frac })),
+    }
+
+    const pairs = Array.isArray(args.distance) ? args.distance : []
+    const triples = Array.isArray(args.angle) ? args.angle : []
+    const clicks = Array.isArray(args.clicks) ? args.clicks : []
+    const picked = []
+
+    if (clicks.length > 0) {
+      const view = args.view ?? {}
+      for (const click of clicks) {
+        const hit = core.pickAtom(structure, { x: Number(click.x), y: Number(click.y), ...view })
+        picked.push(hit ? hit.index : -1)
+      }
+      const hits = picked.filter((index) => index >= 0)
+      for (let index = 1; index < hits.length; index += 1) pairs.push([hits[index - 1], hits[index]])
+    }
+    if (pairs.length === 0 && triples.length === 0 && clicks.length === 0) {
+      throw new Error('至少给一种测量：distance / angle / clicks')
+    }
+
+    const distances = core.measureDistances(structure, pairs)
+    const angles = core.measureAngles(structure, triples)
+    const lines = []
+    for (const item of distances) {
+      lines.push(`  ${structure.atoms[item.i].symbol}${item.i}–${structure.atoms[item.j].symbol}${item.j}: ${item.distance.toFixed(4)} Å`)
+    }
+    for (const item of angles) {
+      lines.push(`  ∠${item.i}-${item.j}-${item.k}: ${item.angle.toFixed(2)}°`)
+    }
+    if (picked.length > 0) {
+      lines.push('  拾取: ' + picked.map((index) => (index >= 0 ? '#' + index : '未命中')).join(', '))
+    }
+    return {
+      ok: true,
+      summary: `测量结果（${structure.atoms.length} 原子）:\n${lines.join('\n')}`,
+      distances: distances.map((item) => ({ i: item.i, j: item.j, distance: item.distance })),
+      angles: angles.map((item) => ({ i: item.i, j: item.j, k: item.k, angle: item.angle })),
+      picked,
+    }
+  },
+})
+
+// ---------------------------------------------------------------------------
+// 体数据显示控制（等值面 / 剖面开关 + 阈值升降）
+// 实测：菜单 144/145 是开关；键盘 +/- 改等值面阈值；.vesta 的 SURFS/SECTS/ISURF 在 CLI 打开时无效
+// ---------------------------------------------------------------------------
+
+const VOLUME_DISPLAY_PARAMS = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['action'],
+  properties: {
+    action: {
+      type: 'string',
+      enum: ['isosurface-toggle', 'sections-toggle', 'level-up', 'level-down'],
+      description: 'isosurface-toggle=显示/隐藏等值面；sections-toggle=显示/隐藏剖面；level-up/level-down=升高/降低等值面阈值',
+    },
+    pid: { type: 'integer', description: 'VESTA 进程 pid（多窗口时指定；取自 vesta_open 返回）。' },
+    count: { type: 'integer', description: 'level-up/level-down 的步数，默认 3。' },
+  },
+}
+
+/**
+ * `vesta_volume_display`：控制 VESTA 里体数据的显示（等值面/剖面开关、阈值升降）。
+ * @param {object} ctx - 插件上下文。
+ * @returns {object} 工具定义。
+ */
+const volumeDisplayTool = (ctx) => localTool({
+  name: 'vesta_volume_display',
+  description:
+    '控制 VESTA 里体数据（CHGCAR/LOCPOT 等）的显示：用菜单 145/144 开关等值面与剖面，'
+    + '用键盘 +/- 升降等值面阈值。当用户说「打开/关掉等值面」「把等值面调大/调小」「显示剖面」时用它；'
+    + '这是实测可行的路径（.vesta 里的 SURFS/SECTS/ISURF 在命令行打开时不会生效）。',
+  parameters: VOLUME_DISPLAY_PARAMS,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['ok', 'summary', 'action'],
+      properties: {
+        ok: { type: 'boolean' },
+        summary: { type: 'string' },
+        action: { type: 'string' },
+        changed: { oneOf: [{ type: 'boolean' }, { type: 'null' }] },
+      },
+    },
+    render: (_args, value) => [{ type: 'text', text: value.summary }],
+  },
+  presentCall: (args) => ({ card: 'generic', title: 'Volume display', kind: 'execute', rawInput: { action: args.action } }),
+  async execute(args, exec) {
+    const core = await import(`./core.js?rev=${Date.now()}`)
+    const target = Number.isInteger(args.pid) ? { pid: args.pid } : 'main'
+    const action = String(args.action)
+    const count = Math.max(1, Math.min(30, Math.round(Number(args.count ?? 3))))
+
+    // 前后各截一张 3D 视口，用哈希判断是否真的变了
+    const stamp = Date.now()
+    const base = sessionDirectory(ctx, exec)
+    const before = await core.captureViewport(target, `${base}/.dsh-vol-${stamp}-a.png`)
+    const beforeHash = core.hashFile(before.path)
+
+    if (action === 'isosurface-toggle') {
+      await core.invokeCommand(145, target)
+    } else if (action === 'sections-toggle') {
+      await core.invokeCommand(144, target)
+    } else if (action === 'level-up') {
+      await core.injectInput(target, 'key', { key: 'plus', count })
+    } else if (action === 'level-down') {
+      await core.injectInput(target, 'key', { key: 'minus', count })
+    } else {
+      throw new Error('不认识的 action：' + action)
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1200))
+
+    const after = await core.captureViewport(target, `${base}/.dsh-vol-${stamp}-b.png`)
+    const afterHash = core.hashFile(after.path)
+    const changed = beforeHash !== afterHash
+    const describe = {
+      'isosurface-toggle': '切换等值面显示（菜单 145）',
+      'sections-toggle': '切换剖面显示（菜单 144）',
+      'level-up': `等值面阈值升高 ${count} 步（键盘 +）`,
+      'level-down': `等值面阈值降低 ${count} 步（键盘 -）`,
+    }[action]
+    return {
+      ok: true,
+      summary: `${describe}；画面${changed ? '已变化 ✓' : '未变化（可能体数据未加载，或已经到边界）'}`,
+      action,
+      changed,
+    }
+  },
+})
+
+// ---------------------------------------------------------------------------
+// 元素配色/半径（VESTA 的 elements.ini）：`style.ini` 的场景字段不生效，真正生效的是这个全局表
+// ---------------------------------------------------------------------------
+
+const STYLE_PARAMS = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['action'],
+  properties: {
+    action: {
+      type: 'string',
+      enum: ['list', 'set', 'restore'],
+      description: 'list=列出元素配色与半径；set=改指定元素；restore=从备份还原 elements.ini',
+    },
+    symbols: { type: 'array', items: { type: 'string' }, description: 'list 用：只列这些元素（默认全部）。' },
+    symbol: { type: 'string', description: 'set 用：要改的元素符号，如 "Si"。' },
+    color: { type: 'array', items: { type: 'integer' }, description: 'set 用：颜色 [r,g,b]（0–255）。' },
+    radius: { type: 'number', description: 'set 用：原子半径（Å，0–10）。' },
+    executable: { type: 'string', description: 'VESTA 可执行文件路径；省略用默认安装位置定位 elements.ini。' },
+  },
+}
+
+/**
+ * `vesta_style`：读写 VESTA 的元素配色与半径（elements.ini）。
+ * @param {object} ctx - 插件上下文。
+ * @returns {object} 工具定义。
+ */
+const styleTool = (ctx) => localTool({
+  name: 'vesta_style',
+  description:
+    '读写 VESTA 的元素配色与原子半径：list 列出现值，set 改某个元素（颜色 [r,g,b] 与半径 Å），restore 从备份还原。'
+    + '当用户说「把这个元素改成红色 / 原子画大一点 / 恢复默认配色」时用它。'
+    + '注意这会改 VESTA 的全局配置文件（会先自动备份，restore 可还原）——实测这是唯一真正生效的配色途径，'
+    + '场景文件 .vesta 里的 ATOMT/BONDP 不会被 VESTA 采用。',
+  parameters: STYLE_PARAMS,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['ok', 'summary', 'action'],
+      properties: {
+        ok: { type: 'boolean' },
+        summary: { type: 'string' },
+        action: { type: 'string' },
+        path: { type: 'string' },
+        elements: { type: 'array', items: { type: 'object', additionalProperties: true } },
+      },
+    },
+    render: (_args, value) => [{ type: 'text', text: value.summary }],
+  },
+  presentCall: (args) => ({ card: 'generic', title: 'Element style', kind: 'execute', rawInput: { action: args.action } }),
+  async execute(args, exec) {
+    const core = await import(`./core.js?rev=${Date.now()}`)
+    const { copyFileSync, existsSync, readFileSync: readText, writeFileSync: writeText } = await import('node:fs')
+    const { dirname: dirOf, join: joinPath } = await import('node:path')
+    const base = sessionDirectory(ctx, exec)
+    const executable = core.toAbsolute(String(args.executable ?? mergedExecutable(ctx) ?? 'D:/VESTA-win64/VESTA.exe'), base)
+    const iniPath = joinPath(dirOf(executable), 'elements.ini')
+    if (!existsSync(iniPath)) throw new Error('找不到 VESTA 的 elements.ini：' + iniPath)
+    const backupPath = iniPath + '.dsh-backup'
+
+    if (args.action === 'list') {
+      const table = core.parseElementsIni(readText(iniPath, 'utf8'))
+      const wanted = Array.isArray(args.symbols) && args.symbols.length > 0 ? args.symbols : [...table.keys()]
+      const rows = wanted.filter((symbol) => table.has(symbol)).map((symbol) => table.get(symbol))
+      const lines = rows.slice(0, 40).map((row) => `  ${row.symbol.padEnd(3)} r=${row.radius.toFixed(2)} ${row.color} rgb(${row.rgb.join(',')})`)
+      return {
+        ok: true,
+        summary: `elements.ini 共 ${table.size} 个元素${rows.length > 40 ? '，下列前 40 个' : ''}：\n${lines.join('\n')}`,
+        action: 'list',
+        path: iniPath,
+        elements: rows.map((row) => ({ symbol: row.symbol, radius: row.radius, color: row.color, rgb: row.rgb })),
+      }
+    }
+
+    if (args.action === 'restore') {
+      if (!existsSync(backupPath)) throw new Error('没有备份文件可还原：' + backupPath)
+      copyFileSync(backupPath, iniPath)
+      const table = core.parseElementsIni(readText(iniPath, 'utf8'))
+      return {
+        ok: true,
+        summary: `已从备份还原 elements.ini（${table.size} 个元素）：${iniPath}`,
+        action: 'restore',
+        path: iniPath,
+      }
+    }
+
+    // set
+    const symbol = String(args.symbol ?? '').trim()
+    if (!symbol) throw new Error('set 需要 symbol（元素符号）')
+    const original = readText(iniPath, 'utf8')
+    const table = core.parseElementsIni(original)
+    if (!table.has(symbol)) throw new Error(`elements.ini 里没有元素 ${symbol}`)
+    if (!existsSync(backupPath)) copyFileSync(iniPath, backupPath)
+    const changes = { [symbol]: {} }
+    if (args.color !== undefined) changes[symbol].color = args.color
+    if (args.radius !== undefined) changes[symbol].radius = args.radius
+    if (Object.keys(changes[symbol]).length === 0) throw new Error('set 至少要给 color 或 radius')
+    const edited = core.editElementsIni(original, changes)
+    if (!edited.changed.includes(symbol)) throw new Error('没能定位到元素行：' + symbol)
+    writeText(iniPath, edited.text, 'utf8')
+    const after = core.parseElementsIni(edited.text).get(symbol)
+    return {
+      ok: true,
+      summary: `已改 ${symbol}：半径 ${table.get(symbol).radius.toFixed(2)} → ${after.radius.toFixed(2)}，`
+        + `颜色 ${table.get(symbol).color} → ${after.color}\n`
+        + `已备份到 ${backupPath}；用 action="restore" 可还原。注意 VESTA 需要重新启动才读到新配色。`,
+      action: 'set',
+      path: iniPath,
+      elements: [{ symbol, radius: after.radius, color: after.color, rgb: after.rgb }],
+    }
+  },
+})
+
+/** 取插件配置里的 VESTA 可执行文件路径。 */
+function mergedExecutable(ctx) {
+  const config = ctx?.config ?? {}
+  return config.executable ?? config.vestaPath ?? null
+}

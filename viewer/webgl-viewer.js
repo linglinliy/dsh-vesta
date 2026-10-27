@@ -98,7 +98,9 @@
     const material = new MeshPhongMaterial({ shininess: 46, specular: 0x5a5a5a })
     atomsMesh = new InstancedMesh(sphereGeometry, material, data.atoms.length)
     data.atoms.forEach((atom, index) => {
-      const r = radiusFor(atom, state.mode)
+      // 部分占位：半径按占位率的 1/3 次方缩小（体积 ∝ 占位率）
+      const occupancy = typeof atom.occupancy === 'number' && atom.occupancy > 0 ? atom.occupancy : 1
+      const r = radiusFor(atom, state.mode) * Math.cbrt(occupancy)
       dummy.position.set(atom.x, atom.y, atom.z)
       dummy.scale.set(r, r, r)
       dummy.quaternion.identity()

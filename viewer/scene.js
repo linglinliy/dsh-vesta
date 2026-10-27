@@ -89,6 +89,8 @@ export function buildScene(structure, options = {}) {
       color: style.color,
       radius: style.radius,
       vdw: vdwRadius(atom.symbol),
+      // 占位率：部分占位在查看器里按体积开三次方缩放半径（等价于「分数球」）
+      occupancy: typeof atom.occupancy === 'number' && Number.isFinite(atom.occupancy) ? atom.occupancy : 1,
     }
   })
 
@@ -281,6 +283,8 @@ export function buildPeriodicScene(structure, options = {}) {
       radius: style.radius,
       vdw: vdwRadius(atom.symbol),
       ghost: false,
+      // 占位率：部分占位在查看器里按体积开三次方缩小半径（等价于「分数球」）
+      occupancy: typeof atom.occupancy === 'number' && Number.isFinite(atom.occupancy) ? atom.occupancy : 1,
     }
   })
   const baseCount = atoms.length

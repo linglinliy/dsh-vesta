@@ -9,10 +9,11 @@
  * @module vesta-core
  */
 
+import { createHash } from 'node:crypto'
 import { execFile, spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { dirname, extname, isAbsolute, join, resolve as resolvePath } from 'node:path'
-import { homedir } from 'node:os'
+import { basename, dirname, extname, isAbsolute, join, resolve as resolvePath } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { ELEMENTS as VIEWER_ELEMENTS } from './viewer/scene.js'
 
@@ -292,6 +293,28 @@ export async function openFiles(config, rawPaths, base) {
  * @param {object} config - `{ executable? }`。
  * @returns {Promise<object>} 结构化状态（键名与工具输出 schema 一一对应）。
  */
+/**
+ * 查找本机正在运行的 VESTA 进程（用于「附着到已有窗口」，避免反复开关新窗口）。
+ *
+ * 用户明确要求过：不要为每个操作重新打开 VESTA。工具/脚本应先用它取 pid，
+ * 再通过各工具的 `pid` 参数作用在同一个窗口上；只有在确实没有运行实例时才新建。
+ * @returns {Array<{ pid: number, title: string }>} 运行中的 VESTA 列表（没有则为空数组）。
+ */
+export function findRunningVesta() {
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-Command',
+    'Get-Process VESTA -ErrorAction SilentlyContinue | Select-Object Id,MainWindowTitle | ConvertTo-Json -Compress'],
+    { encoding: 'utf8', windowsHide: true, timeout: 20000 })
+  const raw = String(result.stdout ?? '').trim()
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    const list = Array.isArray(parsed) ? parsed : [parsed]
+    return list.map((item) => ({ pid: Number(item.Id), title: String(item.MainWindowTitle ?? '') }))
+  } catch {
+    return []
+  }
+}
+
 export async function inspectInstall(config = {}) {
   const probe = probeExecutable(config)
   const root = probe.exists ? dirname(probe.path) : ''
@@ -361,8 +384,55 @@ export function uiSupported() {
  * @param {string[]} args - 传给 vesta-ui.ps1 的参数。
  * @returns {Promise<object>} 脚本返回的 JSON 对象。
  */
+/**
+ * 把 argv 形式的脚本参数（-Action windows -ProcId 123 …）转成宿主请求。
+ * 只转宿主实现了的动作；其它动作返回 null，让调用方回退到「一进程一动作」。
+ * @param {string[]} args - 脚本参数。
+ * @returns {object|null} 宿主请求对象。
+ */
+function argsToHostRequest(args) {
+  const action = args[0] === '-Action' ? String(args[1] ?? '') : ''
+  if (!action || !hostSupports(action)) return null
+  const request = { action }
+  for (let index = 2; index < args.length; index += 1) {
+    const flag = String(args[index] ?? '')
+    const value = args[index + 1]
+    switch (flag) {
+      case '-ProcId': request.pid = Number(value); index += 1; break
+      case '-Hwnd': request.hwnd = Number(value); index += 1; break
+      case '-CommandId': request.id = Number(value); index += 1; break
+      case '-Text': request.text = String(value ?? ''); index += 1; break
+      case '-Out': request.out = String(value ?? ''); index += 1; break
+      case '-X': request.x = Number(value); index += 1; break
+      case '-Y': request.y = Number(value); index += 1; break
+      case '-ToX': request.tox = Number(value); index += 1; break
+      case '-ToY': request.toy = Number(value); index += 1; break
+      case '-Delta': request.delta = Number(value); index += 1; break
+      case '-Count': request.count = Number(value); index += 1; break
+      case '-Steps': request.steps = Number(value); index += 1; break
+      case '-Key': request.key = Number(value); index += 1; break
+      case '-Ctrl': request.ctrl = true; break
+      case '-Enter': request.enter = true; break
+      default: break
+    }
+  }
+  // 尺寸相关的动作必须给出 hwnd
+  if (['gl', 'drag', 'wheel', 'key', 'clickat', 'cmd', 'click', 'settext'].includes(action)
+      && (request.hwnd === undefined || Number.isNaN(request.hwnd))) {
+    return null
+  }
+  return request
+}
+
 function runUiScript(args) {
   if (!uiSupported()) return Promise.reject(new Error('界面控制目前只支持 Windows'))
+  const request = argsToHostRequest(args)
+  if (request) {
+    return callUiHost(request).then((payload) => {
+      if (payload.ok === false) throw new Error(payload.error ?? '控制脚本返回失败')
+      return payload
+    })
+  }
   return new Promise((resolvePromise, reject) => {
     execFile(
       'powershell.exe',
@@ -426,20 +496,26 @@ export async function pickWindow(target = 'main') {
   const procs = await vestaWindows()
   const all = procs.flatMap((proc) => proc.windows.map((window) => ({ ...window, pid: proc.pid })))
   const named = all.filter((window) => window.title && window.visible)
+  // 对话框可能没有标题（实测 VESTA 的「另存为」就是空标题），所以找对话框时只看「可见」，
+  // 不能用 named（它要求标题非空），否则永远定位不到。
+  const visible = all.filter((window) => window.visible)
+  const isMainWindow = (window) => /- VESTA$/i.test(window.title)
+  const isDialogWindow = (window) => !isMainWindow(window)
+    && (window.class === '#32770' || /^wx/.test(window.class) || /^VESTA/i.test(window.class) === false)
   // { pid } 定向：只在该进程的窗口里挑
   if (target && typeof target === 'object' && Number.isFinite(target.pid)) {
     const owned = named.filter((window) => window.pid === target.pid)
-    if (owned.length === 0) {
+    const ownedVisible = visible.filter((window) => window.pid === target.pid)
+    if (owned.length === 0 && ownedVisible.length === 0) {
       throw new Error(`pid=${target.pid} 没有可见的 VESTA 窗口（进程可能已退出）`)
     }
-    const isMainWindow = (window) => /- VESTA$/i.test(window.title)
-    const mainWindow = owned.find(isMainWindow)
+    const mainWindow = owned.find(isMainWindow) ?? owned[0]
     if (target.kind === 'dialog') {
-      const dialog = owned.find((window) => !isMainWindow(window) && (window.class === '#32770' || /^wx/.test(window.class)))
+      const dialog = ownedVisible.find(isDialogWindow)
       if (!dialog) throw new Error(`pid=${target.pid} 当前没有对话框`)
       return dialog
     }
-    return mainWindow ?? owned[0]
+    return mainWindow ?? ownedVisible[0]
   }
   if (target !== undefined && target !== null && /^\d+$/.test(String(target))) {
     const hwnd = Number(target)
@@ -731,6 +807,7 @@ export function buildSupercell(structure, repeat) {
         for (const atom of structure.atoms) {
           const base = fracToCart(atom.frac, structure.a1, structure.a2, structure.a3)
           atoms.push({
+            ...atom,
             symbol: atom.symbol,
             cart: [
               base[0] + i * structure.a1[0] + j * structure.a2[0] + k * structure.a3[0],
@@ -4447,6 +4524,7 @@ export function makeSupercell(structure, repeat) {
       for (let k = 0; k < nz; k += 1) {
         for (const atom of structure.atoms) {
           atoms.push({
+            ...atom,
             symbol: atom.symbol,
             frac: [
               (atom.frac[0] + i) / nx,
@@ -4739,5 +4817,2782 @@ export function parseVasprunXml(text) {
     maxForce,
     stress,
     finalStructure,
+  }
+}
+
+/** 虚拟键码表：只收录 VESTA 里真会用到的键。 */
+export const VIRTUAL_KEYS = {
+  left: 0x25,
+  up: 0x26,
+  right: 0x27,
+  down: 0x28,
+  pageup: 0x21,
+  pagedown: 0x22,
+  home: 0x24,
+  end: 0x23,
+  plus: 0xbb,
+  minus: 0xbd,
+  enter: 0x0d,
+  escape: 0x1b,
+  tab: 0x09,
+  space: 0x20,
+}
+
+/**
+ * 把客户区坐标打包成 Win32 的 lParam（低 16 位 X，高 16 位 Y）。
+ * 抽成纯函数是为了单测：越界/负数不该静默截断成别的点。
+ * @param {number} x - 客户区 X。
+ * @param {number} y - 客户区 Y。
+ * @returns {number} lParam 数值。
+ */
+export function packMousePoint(x, y) {
+  const px = Math.trunc(x)
+  const py = Math.trunc(y)
+  if (!Number.isFinite(px) || !Number.isFinite(py) || px < 0 || py < 0 || px > 65535 || py > 65535) {
+    throw new Error('客户区坐标越界：' + x + ',' + y + '（应在 0–65535）')
+  }
+  return ((py & 0xffff) << 16) | (px & 0xffff)
+}
+
+/**
+ * 找 VESTA 的 3D 视图（wxGLCanvas）并报客户区尺寸与 DPI。
+ * 尺寸每次现取：实测同一窗口会因跨屏/缩放从 564×442 变成 282×221（2×），缓存会点错位置。
+ * @param {string|number|object} [target] - main / dialog / hwnd / { pid }。
+ * @returns {Promise<{ pid: number, hwnd: number|null, gl: number, width: number, height: number, dpi: string|null }>}
+ */
+/** viewport 缓存：pid → { value, at }。窗口会跨屏/缩放改变尺寸，所以只缓存 10 秒。 */
+const viewportCache = new Map()
+
+/** 清掉 viewport 缓存（窗口重新打开、结构切换后调用）。 */
+export function clearViewportCache(pid) {
+  if (pid === undefined) viewportCache.clear()
+  else viewportCache.delete(Number(pid))
+}
+
+/**
+ * 找 VESTA 的 3D 视图（wxGLCanvas）并报客户区尺寸与 DPI。
+ * 优先用宿主的复合动作 viewport（一次往返）；pid 未知时退回 pickWindow 路线。
+ * 尺寸每次现取：实测同一窗口会因跨屏/缩放从 564×442 变成 282×221（2×），缓存会点错位置。
+ * @param {string|number|object} [target] - main / dialog / hwnd / { pid }。
+ * @returns {Promise<{ pid: number, hwnd: number|null, gl: number, width: number, height: number, dpi: string|null, title?: string }>}
+ */
+export async function findViewport(target) {
+  let pid = null
+  if (target && typeof target === 'object' && Number.isFinite(target.pid)) pid = Number(target.pid)
+  else if (Number.isFinite(Number(target)) && Number(target) > 0) pid = null // hwnd 形式，走下面的通用路线
+
+  if (pid) {
+    const cached = viewportCache.get(pid)
+    if (cached && Date.now() - cached.at < 10000) return cached.value
+    const response = await callUiHost({ action: 'viewport', pid })
+    if (!response.ok || !response.gl) {
+      throw new Error('这个窗口里没有 3D 视图（wxGLCanvas）：确认已打开结构文件，且窗口没有最小化')
+    }
+    const [width, height] = String(response.client ?? '').split('x').map(Number)
+    const value = {
+      pid,
+      hwnd: Number(response.hwnd) || null,
+      gl: Number(response.gl),
+      width: Number.isFinite(width) ? width : 0,
+      height: Number.isFinite(height) ? height : 0,
+      dpi: response.dpi ?? null,
+      title: response.title ?? '',
+    }
+    viewportCache.set(pid, { value, at: Date.now() })
+    return value
+  }
+
+  const window = await pickWindow(target)
+  const result = await runUiScript(['-Action', 'gl', '-Hwnd', String(window.hwnd)])
+  if (!result?.ok || !result.gl) {
+    throw new Error('这个窗口里没有 3D 视图（wxGLCanvas）：确认是 VESTA 主窗口，且已打开结构文件')
+  }
+  const [width, height] = String(result.client ?? '').split('x').map(Number)
+  return {
+    pid: window.pid,
+    hwnd: window.hwnd,
+    gl: Number(result.gl),
+    width: Number.isFinite(width) ? width : 0,
+    height: Number.isFinite(height) ? height : 0,
+    dpi: result.dpi ?? null,
+  }
+}
+// ── VESTA UI 常驻宿主 ──────────────────────────────────────────────────
+// 为什么：每次 spawn powershell 都要重新 Add-Type 编译一遍 Win32 声明（实测单次动作 ~14 s），
+// 直接操作的手感要求几十毫秒，所以起一个常驻进程，stdin 一行 JSON、stdout 一行 JSON。
+const HOST_ACTIONS = new Set(['windows', 'gl', 'drag', 'wheel', 'key', 'clickat', 'cmd', 'click', 'clickpost', 'settext', 'type', 'capture', 'clickcenter', 'realmouse', 'focusattach', 'chars', 'vk', 'foreground', 'chord', 'saveenv', 'restoreenv', 'keypost', 'realclickat', 'rect', 'realdrag', 'realkey', 'clientorigin'])
+
+// 常驻宿主句柄放在 globalThis 上：插件为了热重载会用带 rev 查询串的 import 反复加载本模块，
+// 每次都是新的模块实例；句柄只存实例里的话，另一份实例的 stopUiHost() 停不掉子进程，
+// 结果就是进程退出后残留一个 PowerShell（实测会拖住测试进程不退出）。
+const HOST_STATE_KEY = '__dshVestaUiHostState'
+let uiHostState = globalThis[HOST_STATE_KEY] ?? null
+const setUiHostState = (state) => {
+  uiHostState = state
+  globalThis[HOST_STATE_KEY] = state
+}
+
+/** 启动（或复用）常驻宿主；失败返回 null（调用方回退到一进程一动作）。 */
+export function startUiHost() {
+  // 先认全局句柄：工具里用带 rev 的 import 会造出新的模块实例，宿主可能已经由别的实例起过
+  const shared = globalThis[HOST_STATE_KEY]
+  if (shared && !shared.closed) { uiHostState = shared; return shared }
+  if (uiHostState && !uiHostState.closed) return uiHostState
+  const script = join(dirname(fileURLToPath(import.meta.url)), 'win', 'vesta-ui.ps1')
+  const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Action', 'host'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  })
+  const state = { child, closed: false, buffer: '', pending: [], ready: false }
+  setUiHostState(state)
+  // 兜底：进程退出时确保宿主子进程被带走（短生命周期进程里容易漏掉，留下孤儿 PowerShell）
+  if (!globalThis.__dshVestaUiHostExitHook) {
+    globalThis.__dshVestaUiHostExitHook = true
+    process.on('exit', () => {
+      try {
+        const current = globalThis[HOST_STATE_KEY]
+        if (current && !current.closed) current.child.kill()
+      } catch { /* 忽略 */ }
+    })
+  }
+  child.stdout.setEncoding('utf8')
+  child.stdout.on('data', (chunk) => {
+    state.buffer += chunk
+    let index = state.buffer.indexOf('\n')
+    while (index >= 0) {
+      const line = state.buffer.slice(0, index).trim()
+      state.buffer = state.buffer.slice(index + 1)
+      if (line) {
+        let payload = null
+        try {
+          payload = JSON.parse(line)
+        } catch {
+          payload = { ok: false, error: '宿主返回了非 JSON：' + line.slice(0, 120) }
+        }
+        // 宿主启动后会先吐一行 ready，它不是任何请求的响应；把它当响应会让之后全部错位一格
+        if (payload && payload.ready === true) {
+          state.ready = true
+        } else {
+          const resolver = state.pending.shift()
+          if (resolver) resolver(payload)
+        }
+      }
+      index = state.buffer.indexOf('\n')
+    }
+  })
+  child.stderr.setEncoding('utf8')
+  child.on('error', () => { state.closed = true })
+  child.on('exit', () => {
+    state.closed = true
+    while (state.pending.length > 0) {
+      const resolver = state.pending.shift()
+      if (resolver) resolver({ ok: false, error: 'VESTA UI 宿主进程退出' })
+    }
+  })
+  child.stdin.write('hello\n')
+  uiHostState = state
+  return state
+}
+
+/** 关闭常驻宿主（测试与插件卸载用）。 */
+export function stopUiHost() {
+  // 关键：不能用模块加载时缓存的 uiHostState——宿主可能是另一个模块实例启动的
+  const state = globalThis[HOST_STATE_KEY] ?? uiHostState
+  if (!state) return
+  try {
+    state.child.stdin.end()
+    state.child.kill()
+  } catch {
+    /* 忽略 */
+  }
+  uiHostState = null
+  globalThis[HOST_STATE_KEY] = null
+}
+
+/**
+ * 向常驻宿主发一条请求并等响应。
+ * @param {object} request - 请求对象：action 加各动作自己的字段。
+ * @param {number} [timeoutMs] - 超时（毫秒）。
+ * @returns {Promise<object>} 宿主返回的 JSON。
+ */
+export function callUiHost(request, timeoutMs = 15000) {
+  const state = startUiHost()
+  if (state.closed) throw new Error('VESTA UI 宿主不可用')
+  return new Promise((resolvePromise, reject) => {
+    const timer = setTimeout(() => {
+      const index = state.pending.indexOf(settle)
+      if (index >= 0) state.pending.splice(index, 1)
+      reject(new Error('VESTA UI 宿主超时：' + request.action))
+    }, timeoutMs)
+    const settle = (payload) => {
+      clearTimeout(timer)
+      resolvePromise(payload)
+    }
+    state.pending.push(settle)
+    state.child.stdin.write(JSON.stringify(request) + '\n')
+  })
+}
+
+/** 判断某个动作是否走宿主（宿主只实现了热路径动作）。 */
+export function hostSupports(action) {
+  return HOST_ACTIONS.has(action)
+}
+
+
+/**
+ * 向 VESTA 的 3D 视图注入输入（等价于鼠标/键盘直接操作）。
+ *
+ * 为什么能行：VESTA 是 wxWidgets 程序，3D 视图就是真正的 wxGLCanvas 子窗口，
+ * PostMessage 投递 WM_LBUTTONDOWN/WM_MOUSEMOVE/WM_MOUSEWHEEL 与真实鼠标等价
+ * （实测拖拽可旋转、滚轮可缩放，且不需要窗口置前）。
+ * 方向键需要焦点，所以脚本会先 SetForegroundWindow。
+ *
+ * @param {string|number|object} target - 目标窗口（main/dialog/hwnd/{pid}）。
+ * @param {'drag'|'wheel'|'key'|'click'|'type'} action - 动作。
+ * @param {object} [options] - 各动作的参数。
+ * @returns {Promise<object>} 注入结果（含视图尺寸、实际坐标、耗时）。
+ */
+/**
+ * 向 VESTA 的 3D 视图注入输入（等价于鼠标/键盘直接操作）。
+ *
+ * 为什么能行：VESTA 是 wxWidgets 程序，3D 视图就是真正的 wxGLCanvas 子窗口，
+ * PostMessage 投递 WM_LBUTTONDOWN/WM_MOUSEMOVE/WM_MOUSEWHEEL 与真实鼠标等价
+ * （实测拖拽可旋转、滚轮可缩放，且不需要窗口置前）。
+ * 方向键需要焦点，所以脚本会先 SetForegroundWindow。
+ *
+ * 热路径只给 pid：这样不触发 pickWindow（它要起 tasklist 枚举进程），单次动作能压到几十毫秒。
+ *
+ * @param {string|number|object} target - 目标窗口（main/dialog/hwnd/{ pid }）。
+ * @param {'drag'|'wheel'|'key'|'click'|'type'} action - 动作。
+ * @param {object} [options] - 各动作的参数。
+ * @returns {Promise<object>} 注入结果（含视图尺寸、实际坐标、耗时）。
+ */
+export async function injectInput(target, action, options = {}) {
+  const started = Date.now()
+  if (!['drag', 'wheel', 'key', 'click', 'type'].includes(action)) {
+    throw new Error('不支持的输入动作：' + action + '（可选 drag / wheel / key / click / type）')
+  }
+  const fastPid = target && typeof target === 'object' && Number.isFinite(Number(target.pid))
+    ? { pid: Number(target.pid) }
+    : null
+  const viewportTarget = fastPid ?? target
+
+  // 先把键名解析掉：非法键名应该立刻报错，而不是先去连 VESTA 再报「找不到窗口」
+  let vk = 0
+  if (action === 'key') {
+    vk = Number(options.key)
+    if (!Number.isFinite(vk) || vk <= 0) {
+      const name = String(options.key ?? '').toLowerCase().replace(/^(vk_|arrow)/, '')
+      vk = VIRTUAL_KEYS[name]
+      if (!vk) throw new Error('不认识的键名：' + options.key + '（可选 ' + Object.keys(VIRTUAL_KEYS).join(' / ') + '）')
+    }
+  }
+
+  if (action === 'type') {
+    const text = String(options.text ?? '')
+    if (!text) throw new Error('type 需要 text')
+    const view = await findViewport(viewportTarget)
+    const result = await runUiScript([
+      '-Action', 'type', '-Hwnd', String(view.hwnd), '-Text', text, ...(options.enter ? ['-Enter'] : []),
+    ])
+    if (!result?.ok) throw new Error('打字失败：' + (result?.error ?? '未知原因'))
+    return {
+      action, pid: view.pid, hwnd: view.hwnd, typed: text.length,
+      enter: Boolean(options.enter), ms: Date.now() - started,
+    }
+  }
+
+  const view = await findViewport(viewportTarget)
+  const centerX = Math.round(view.width / 2)
+  const centerY = Math.round(view.height / 2)
+
+  if (action === 'drag') {
+    const dx = Number(options.dx ?? 120)
+    const dy = Number(options.dy ?? 0)
+    const x = Number.isFinite(options.x) ? Math.round(options.x) : centerX
+    const y = Number.isFinite(options.y) ? Math.round(options.y) : centerY
+    const toX = Math.max(0, Math.min(view.width - 1, x + Math.round(dx)))
+    const toY = Math.max(0, Math.min(view.height - 1, y + Math.round(dy)))
+    const steps = Math.max(1, Math.min(60, Math.round(Number(options.steps ?? 12))))
+    await callUiHost({
+      action: 'drag', hwnd: view.gl, x, y, tox: toX, toy: toY, steps,
+    })
+    if (!options.__skipHistory) {
+      const entry = historyOf(view.pid)
+      entry.undo.push({ action, options: { ...options, dx, dy } })
+      entry.redo.length = 0
+    }
+    return {
+      action, pid: view.pid, gl: view.gl, client: view.width + 'x' + view.height,
+      from: { x, y }, to: { x: toX, y: toY }, ms: Date.now() - started,
+    }
+  }
+
+  if (action === 'wheel') {
+    const delta = Math.round(Number(options.delta ?? 120))
+    const count = Math.max(1, Math.min(50, Math.round(Number(options.count ?? 1))))
+    await callUiHost({
+      action: 'wheel', hwnd: view.gl, delta, count,
+      ...(Number.isFinite(options.x) ? { x: Math.round(options.x) } : {}),
+      ...(Number.isFinite(options.y) ? { y: Math.round(options.y) } : {}),
+    })
+    if (!options.__skipHistory) {
+      const entry = historyOf(view.pid)
+      entry.undo.push({ action, options: { ...options, delta, count } })
+      entry.redo.length = 0
+    }
+    return {
+      action, pid: view.pid, gl: view.gl, delta, count,
+      client: view.width + 'x' + view.height, ms: Date.now() - started,
+    }
+  }
+
+  if (action === 'click') {
+    const x = Number.isFinite(options.x) ? Math.round(options.x) : centerX
+    const y = Number.isFinite(options.y) ? Math.round(options.y) : centerY
+    await callUiHost({ action: 'clickat', hwnd: view.gl, x, y })
+    return {
+      action, pid: view.pid, gl: view.gl, at: { x, y },
+      client: view.width + 'x' + view.height, ms: Date.now() - started,
+    }
+  }
+
+  // key（vk 已在函数开头解析）
+  const count = Math.max(1, Math.min(50, Math.round(Number(options.count ?? 1))))
+  await callUiHost({
+    action: 'key', hwnd: view.hwnd, key: vk, count, ctrl: Boolean(options.ctrl),
+  })
+  if (!options.__skipHistory) {
+    const entry = historyOf(view.pid)
+    // 必须存解析后的键码：存名字（"left"）会让 inverseInput 拿到 NaN 而静默跳过
+    entry.undo.push({ action, options: { key: vk, count, ctrl: Boolean(options.ctrl) } })
+    entry.redo.length = 0
+  }
+  return {
+    action, pid: view.pid, hwnd: view.hwnd, vk, count,
+    ctrl: Boolean(options.ctrl), ms: Date.now() - started,
+  }
+}
+
+/**
+ * 文件内容哈希（sha256 前 16 位）：用来判断两次截图是否真有变化。
+ * @param {string} path - 文件路径。
+ * @returns {string} 十六进制摘要。
+ */
+export function hashFile(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex').slice(0, 16)
+}
+
+/**
+ * 把「视角」参数翻译成 VESTA 命令行的旋转开关。
+ * 该能力不是官方公开 API（手册第 17 章只列了 -open/-export_img/-close），
+ * 但在本机 VESTA 3.x 上实测有效：-rotate_x 30 会让视图绕 x 轴转 30°，
+ * 导出图与不旋转的图哈希不同、视觉上也确实转了。
+ * @param {{ rx?: number, ry?: number, rz?: number }} [view] - 三个轴的旋转角度（度）。
+ * @returns {string[]} 追加到 VESTA 命令行里的参数。
+ */
+export function viewToCliArgs(view = {}) {
+  const args = []
+  for (const [key, flag] of [['rx', '-rotate_x'], ['ry', '-rotate_y'], ['rz', '-rotate_z']]) {
+    const value = Number(view[key])
+    if (Number.isFinite(value) && value !== 0) {
+      args.push(flag, String(value))
+    }
+  }
+  return args
+}
+
+/**
+ * 批量出图：同一个结构、同一套渲染参数，只改视角——用于「模板化、可复现」的成图。
+ *
+ * 每个视角跑一次 VESTA CLI（GUI 程序不会自己退出，靠轮询产物判断完成），
+ * 最后写一份 manifest（输入文件、参数、输出、大小、耗时），保证每张图可追溯。
+ * @param {object} config - `{ executable }`（或环境变量 VESTA_EXE）。
+ * @param {object} options - 批量参数。
+ * @param {string} options.structure - 结构/体积文件路径。
+ * @param {Array<{ name?: string, rx?: number, ry?: number, rz?: number, scale?: number }>} options.views - 视角列表。
+ * @param {string} options.outDir - 输出目录。
+ * @param {number} [options.scale] - 默认放大倍数（默认 2）。
+ * @param {number} [options.timeoutMs] - 单张超时（默认 60 s）。
+ * @returns {Promise<{ outDir: string, manifest: string, renders: Array<object> }>}
+ */
+export async function renderViewsWithCli(config, options = {}) {
+  const structure = toAbsolute(String(options.structure ?? ''), process.cwd())
+  if (!structure || !existsSync(structure)) throw new Error('找不到结构文件：' + (options.structure ?? '(空)'))
+  const views = Array.isArray(options.views) && options.views.length > 0
+    ? options.views
+    : [{ name: 'default' }]
+  const outDir = toAbsolute(String(options.outDir ?? join(dirname(structure), 'vesta-render')), process.cwd())
+  mkdirSync(outDir, { recursive: true })
+  const defaultScale = Number.isFinite(options.scale) ? Math.round(options.scale) : 2
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 60000
+  const inputHashFull = createHash('sha256').update(readFileSync(structure)).digest('hex')
+
+  const probe = probeExecutable(config)
+  if (!probe.exists) throw new Error('找不到 VESTA 可执行文件：' + (probe.problem ?? probe.path))
+
+  // 场景模板：给了 template 就先按「模板 + 结构」生成 .vesta，再对场景出图。
+  // 批量出图的风格（样式/配色/键参数/视角）因此来自模板，与被渲染的结构无关。
+  let target = structure
+  let scenePath = null
+  if (options.template) {
+    const templatePath = toAbsolute(String(options.template), process.cwd())
+    if (!existsSync(templatePath)) throw new Error('找不到场景模板：' + templatePath)
+    const templateText = readFileSync(templatePath, 'utf8')
+    const parsed = parsePoscar(readFileSync(structure, 'utf8'), basename(structure))
+    const built = buildVestaFromTemplate(templateText, {
+      title: basename(structure),
+      lattice: [parsed.a1, parsed.a2, parsed.a3],
+      atoms: parsed.atoms.map((atom) => ({ element: atom.symbol, frac: atom.frac })),
+    })
+    // 场景样式：只套用实测 VESTA 会认的字段（BKGRC / MODEL），其余留给模板
+    let styled = options.sceneStyle && (options.sceneStyle.background || options.sceneStyle.model !== undefined)
+      ? applySceneStyle(built, options.sceneStyle) : built
+    // 显示边界（BOUND）：控制显示多少个晶胞，实测只改这 6 个数就能改变渲染
+    if (options.sceneStyle?.boundary) styled = applySceneBoundary(styled, options.sceneStyle.boundary)
+    scenePath = join(outDir, 'scene.vesta')
+    writeFileSync(scenePath, styled, 'utf8')
+    target = scenePath
+  }
+
+  const renders = []
+  for (let index = 0; index < views.length; index += 1) {
+    const view = views[index] ?? {}
+    const name = String(view.name ?? ('view-' + String(index + 1).padStart(2, '0')))
+    const scale = Number.isFinite(view.scale) ? Math.round(view.scale) : defaultScale
+    const out = join(outDir, name + '.png')
+    const args = ['-open', target, ...viewToCliArgs(view), '-export_img', 'scale=' + scale, out, '-close']
+    const started = Date.now()
+    const result = await runVestaOutput(config, args, out, { timeoutMs, minBytes: 1024 })
+    renders.push({
+      name,
+      out,
+      bytes: result.bytes,
+      scale,
+      view: { rx: Number(view.rx ?? 0), ry: Number(view.ry ?? 0), rz: Number(view.rz ?? 0) },
+      ms: Date.now() - started,
+    })
+  }
+
+  const manifestPath = join(outDir, 'manifest.json')
+  const manifest = {
+    structure,
+    scene: scenePath,
+    structureSha256: inputHashFull,
+    executable: probe.path,
+    generatedAt: new Date().toISOString(),
+    viewCount: renders.length,
+    renders,
+  }
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8')
+  return { outDir, manifest: manifestPath, renders }
+}
+
+/**
+ * `.vesta` 工程文件（VESTA_FORMAT_VERSION 3.x）的文本层解析。
+ *
+ * 这个文件是「文本剧本」：一行一个段名（大写），后面跟若干行数据。
+ * 段里有结构（CELLP / STRUC）、显示设置（STYLE / ATOMT / BONDP / LIGHT*）、
+ * 以及一个 4×4 的 LMATRIX —— 实测它就是当前视图的取向矩阵（正交、行列式为 ±1）。
+ * @param {string} text - .vesta 文件内容。
+ * @returns {{ version: string|null, order: string[], blocks: Map<string, string[]>, structure: { atoms: Array<{ index: number, element: string, label: string, occupancy: number, frac: number[] }>, cell: number[]|null }, matrix: number[][]|null }}
+ */
+export function parseVestaProject(text) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  let version = null
+  const order = []
+  const blocks = new Map()
+  const inline = new Map()
+  let current = null
+  let currentLines = []
+
+  const flush = () => {
+    if (current) {
+      blocks.set(current, currentLines)
+      order.push(current)
+    }
+    current = null
+    currentLines = []
+  }
+
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, '')
+    const versionMatch = /^#VESTA_FORMAT_VERSION\s+(\S+)/.exec(line)
+    if (versionMatch) {
+      version = versionMatch[1]
+      continue
+    }
+    const header = /^([A-Z][A-Z0-9_]{2,})(?:\s+(\S.*))?$/.exec(line)
+    if (header) {
+      flush()
+      current = header[1]
+      // 段名后面同一行的内容要原样保留：VESTA 的 "THERI 1"、"BOUND 0 1 0 1 0 1" 都属于这种行内参数
+      inline.set(current, header[2] ?? null)
+      currentLines = []
+      continue
+    }
+    if (current) currentLines.push(line)
+  }
+  flush()
+
+  // 结构：STRUC 段每原子 2 行（第 2 行是位移参数），最后以 "0 0 0 0 0 0 0" 结束
+  const atoms = []
+  const struc = blocks.get('STRUC') ?? []
+  for (const line of struc) {
+    if (/^\s*0\s+0\s+0\s+0\s+0\s+0\s+0\s*$/.test(line)) break
+    const match = /^\s*(\d+)\s+(\S+)\s+(\S+)\s+([\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)/.exec(line)
+    if (!match) continue
+    atoms.push({
+      index: Number(match[1]),
+      element: match[2],
+      label: match[3],
+      occupancy: Number(match[4]),
+      frac: [Number(match[5]), Number(match[6]), Number(match[7])],
+    })
+  }
+
+  // 晶胞参数：CELLP 第一行 a b c α β γ
+  let cell = null
+  const cellp = blocks.get('CELLP') ?? []
+  if (cellp.length > 0) {
+    const numbers = cellp[0].trim().split(/\s+/).map(Number)
+    if (numbers.length >= 6 && numbers.every((value) => Number.isFinite(value))) cell = numbers.slice(0, 6)
+  }
+
+  // LMATRIX：前 3 行是 3×3 取向矩阵，第 4 行是平移，再一行 3 个数
+  let matrix = null
+  const lm = blocks.get('LMATRIX') ?? []
+  if (lm.length >= 3) {
+    const rows = lm.slice(0, 3).map((line) => line.trim().split(/\s+/).map(Number).slice(0, 3))
+    if (rows.every((row) => row.length === 3 && row.every((value) => Number.isFinite(value)))) matrix = rows
+  }
+
+  return { version, order, blocks, inline, structure: { atoms, cell }, matrix }
+}
+
+/** 把 3×3 矩阵按 .vesta 的 LMATRIX 版式排版（4 列，最后一列恒 0）。 */
+export function formatVestaMatrix(matrix, translation = [0, 0, 0]) {
+  const rows = []
+  for (const row of matrix) rows.push(` ${row.map((value) => value.toFixed(6).padStart(10)).join('')}  0.000000`)
+  rows.push(` ${translation.map((value) => value.toFixed(6).padStart(10)).join('')}  1.000000`)
+  return rows
+}
+
+/**
+ * 用模板生成一份新的 `.vesta`：保留模板的显示设置，只替换结构相关段。
+ *
+ * 需要替换的段：TITLE、CELLP、STRUC、THERI、SITET、SBOND（元素对依赖结构）、QCORIG。
+ * 其中 SBOND 直接按「新结构里出现过的元素对」重新生成，键长范围沿用模板的默认值。
+ * @param {string} templateText - 模板 .vesta 内容（来自已批准的渲染设置）。
+ * @param {{ title?: string, cell: number[], atoms: Array<{ element: string, frac: number[] }> }} structure - 新结构。
+ * @returns {string} 新的 .vesta 文本。
+ */
+export function buildVestaFromTemplate(templateText, structure) {
+  const parsed = parseVestaProject(templateText)
+  if (!parsed.version) throw new Error('模板不像是 .vesta 文件（缺少 #VESTA_FORMAT_VERSION）')
+  if (!structure?.atoms?.length) throw new Error('新结构没有原子')
+  // cell 允许两种给法：6 个标量，或 3 个晶格矢量（parsePoscar 的 a1..a3）
+  if ((!Array.isArray(structure.cell) || structure.cell.length < 6) && Array.isArray(structure.lattice) && structure.lattice.length === 3) {
+    const params = cellParameters(structure.lattice)
+    structure = { ...structure, cell: [params.a, params.b, params.c, params.alpha, params.beta, params.gamma] }
+  }
+  if (!Array.isArray(structure.cell) || structure.cell.length < 6) throw new Error('新结构缺少晶胞参数')
+
+  const title = String(structure.title ?? 'scene').slice(0, 80)
+  const cellLine = '  ' + structure.cell.slice(0, 6)
+    .map((value) => (Math.round(Number(value) * 1e4) / 1e4).toFixed(6))
+    .join('  ')
+  const zeros = '  0.000000  0.000000  0.000000  0.000000  0.000000  0.000000'
+
+  const struc = []
+  structure.atoms.forEach((atom, index) => {
+    const frac = atom.frac.map((value) => value.toFixed(6)).join('  ')
+    struc.push(`${String(index + 1).padStart(3)} ${String(atom.element).padEnd(4)}${(atom.element + String(index + 1)).padEnd(6)}  1.0000 ${frac}    1a       1`)
+    struc.push('                            0.000000   0.000000   0.000000  0.00')
+  })
+  struc.push('  0 0 0 0 0 0 0')
+
+  const theri = ['THERI 1']
+  structure.atoms.forEach((atom, index) => {
+    theri.push(`${String(index + 1).padStart(3)}        ${(atom.element + String(index + 1)).padEnd(6)} -0.000000`)
+  })
+  theri.push('  0 0 0')
+
+  const site = ['SITET']
+  structure.atoms.forEach((atom, index) => {
+    site.push(`${String(index + 1).padStart(3)}        ${(atom.element + String(index + 1)).padEnd(6)}  1.1800  27  59 250  27  59 250 204  0`)
+  })
+  site.push('  0 0 0 0 0 0')
+
+  const elements = [...new Set(structure.atoms.map((atom) => atom.element))]
+  const sbond = ['SBOND']
+  for (const a of elements) {
+    for (const b of elements) {
+      sbond.push(`  1    ${a.padEnd(4)}${b.padEnd(4)}    0.00000    2.60000  0  1  1  0  1  0.250  2.000 127 127 127`)
+    }
+  }
+  sbond.push('  0 0 0 0')
+
+  const replacements = new Map([
+    ['TITLE', [title]],
+    ['CELLP', [cellLine, zeros]],
+    ['STRUC', struc],
+    ['THERI', theri],
+    ['SITET', site],
+    ['SBOND', sbond],
+    ['QCORIG', ['         0         0         0']],
+  ])
+
+  // 按模板原有顺序重排；模板里没有的段（如 THERI/SITET）插到 STRUC 之后
+  const out = [`#VESTA_FORMAT_VERSION ${parsed.version}`, '', '']
+  const emitted = new Set()
+  for (const name of parsed.order) {
+    const body = replacements.get(name) ?? parsed.blocks.get(name)
+    if (!body) continue
+    const args = parsed.inline?.get(name)
+    out.push(args ? name + ' ' + args : name)
+    for (const line of body) out.push(line)
+    out.push('')
+    emitted.add(name)
+  }
+  // 模板缺少的段，补在 STRUC 之后
+  for (const [name, body] of replacements) {
+    if (emitted.has(name)) continue
+    out.push(name)
+    for (const line of body) out.push(line)
+    out.push('')
+  }
+  return out.join('\n')
+}
+
+/** 键码的「反向键」：方向键与加减键成对。 */
+const OPPOSITE_KEYS = new Map([
+  [0x25, 0x27], [0x27, 0x25], // left ↔ right
+  [0x26, 0x28], [0x28, 0x26], // up ↔ down
+  [0x21, 0x22], [0x22, 0x21], // pageup ↔ pagedown
+  [0xbb, 0xbd], [0xbd, 0xbb], // plus ↔ minus
+])
+
+/**
+ * 计算一个输入动作的「逆动作」。
+ *
+ * 依据（实测）：视图操作可以被精确反演——拖拽 +120 再 -120、滚轮 +2 再 -2、
+ * 方向键 left×2 再 right×2，截图哈希都回到基线。所以撤销不需要 VESTA 有 undo 栈。
+ * @param {'drag'|'wheel'|'key'|'click'|'type'} action - 原动作。
+ * @param {object} [options] - 原参数。
+ * @returns {{ action: string, options: object }|null} 逆动作；不可逆（click/type）返回 null。
+ */
+export function inverseInput(action, options = {}) {
+  if (action === 'drag') {
+    return { action: 'drag', options: { dx: -Number(options.dx ?? 0), dy: -Number(options.dy ?? 0), steps: options.steps } }
+  }
+  if (action === 'wheel') {
+    return { action: 'wheel', options: { delta: -Number(options.delta ?? 120), count: options.count } }
+  }
+  if (action === 'key') {
+    const raw = options.key
+    const vk = Number.isFinite(Number(raw))
+      ? Number(raw)
+      : VIRTUAL_KEYS[String(raw ?? '').toLowerCase().replace(/^(vk_|arrow)/, '')]
+    const opposite = OPPOSITE_KEYS.get(vk)
+    if (!opposite) return null
+    return { action: 'key', options: { key: opposite, count: options.count, ctrl: options.ctrl } }
+  }
+  // click / type 没有逆操作：点选与文本输入无法靠反向输入撤销
+  return null
+}
+
+/** 每个 pid 一条输入栈：undo 存已做的动作，redo 存被撤销的动作。 */
+const inputHistory = new Map()
+
+/** 取某个 pid 的历史（测试与工具用）。 */
+export function getInputHistory(pid) {
+  const entry = inputHistory.get(Number(pid))
+  return {
+    undo: entry ? entry.undo.map((item) => ({ action: item.action, options: item.options })) : [],
+    redo: entry ? entry.redo.map((item) => ({ action: item.action, options: item.options })) : [],
+  }
+}
+
+/** 清掉输入历史（窗口重开/结构切换后调用）。 */
+export function clearInputHistory(pid) {
+  if (pid === undefined) inputHistory.clear()
+  else inputHistory.delete(Number(pid))
+}
+
+function historyOf(pid) {
+  const key = Number(pid)
+  if (!inputHistory.has(key)) inputHistory.set(key, { undo: [], redo: [] })
+  return inputHistory.get(key)
+}
+
+/**
+ * 撤销上一次可逆的输入（drag / wheel / key），返回实际发出的逆动作。
+ * @param {string|number|object} target - 目标窗口（含 pid 的对象最省事）。
+ * @returns {Promise<{ undone: { action: string, options: object }, restored: boolean }>}
+ */
+export async function undoInput(target) {
+  const view = await findViewport(target)
+  const entry = historyOf(view.pid)
+  while (entry.undo.length > 0) {
+    const last = entry.undo.pop()
+    const inverse = inverseInput(last.action, last.options)
+    if (!inverse) continue // 不可逆的动作直接跳过
+    await injectInput({ pid: view.pid }, inverse.action, { ...inverse.options, __skipHistory: true })
+    entry.redo.push(last)
+    return { undone: { action: last.action, options: last.options }, restored: true }
+  }
+  return { undone: null, restored: false }
+}
+
+/**
+ * 重做上一次被撤销的输入。
+ * @param {string|number|object} target - 目标窗口。
+ * @returns {Promise<{ redone: object|null, restored: boolean }>}
+ */
+export async function redoInput(target) {
+  const view = await findViewport(target)
+  const entry = historyOf(view.pid)
+  const next = entry.redo.pop()
+  if (!next) return { redone: null, restored: false }
+  await injectInput({ pid: view.pid }, next.action, { ...next.options, __skipHistory: true })
+  entry.undo.push(next)
+  return { redone: { action: next.action, options: next.options }, restored: true }
+}
+
+/**
+ * 只截 VESTA 的 3D 视口（wxGLCanvas），不含面板/状态栏。
+ * 为什么需要：整窗截图里文本区、状态栏会变，做「操作是否生效 / 是否还原」的哈希比对时是噪声。
+ * @param {string|number|object} target - 同 findViewport。
+ * @param {string} out - 输出 PNG 路径。
+ * @returns {Promise<{ path: string, gl: number, size: string }>}
+ */
+export async function captureViewport(target, out) {
+  const view = await findViewport(target)
+  const path = toAbsolute(String(out), process.cwd())
+  mkdirSync(dirname(path), { recursive: true })
+  const result = await callUiHost({ action: 'capture', hwnd: view.gl, out: path })
+  if (!result?.ok) throw new Error('视口截图失败：' + (result?.error ?? '未知原因'))
+  return { path, gl: view.gl, size: result.size ?? '' }
+}
+
+/**
+ * 点击某个控件/窗口的中心（让它获得焦点）。
+ * 用途：VESTA 的文件对话框里，先点一下文件名输入框，再用 SendKeys 打字。
+ * @param {number} hwnd - 目标控件窗口句柄。
+ * @returns {Promise<void>} 无返回值；失败抛错。
+ */
+export async function clickControlCenter(hwnd) {
+  const result = await callUiHost({ action: 'clickcenter', hwnd: Number(hwnd) })
+  if (!result?.ok) throw new Error('点击控件中心失败：' + (result?.error ?? '未知原因'))
+}
+
+/**
+ * 把数字填进一个 GUI 数值框（wx 对话框）：真鼠标点击 → Ctrl+A 全选 → 虚拟键码逐位输入。
+ *
+ * 为什么不用 WM_SETTEXT / SendKeys：实测 VESTA 的 wx 数值框对 WM_SETTEXT 完全无反应，
+ * 而 SendKeys 的文字映射会写出乱码（截图里出现 "1......嗅"）；虚拟键码（0-9 = 48-57）是布局无关的，
+ * 能正确落进字段。注意 wx 字段的值用 WM_GETTEXT 读不出来，验证要靠截图或下游效果。
+ * @param {number} hwnd - 目标输入框的窗口句柄。
+ * @param {string|number} value - 要填入的数值（可含负号与小数点）。
+ * @returns {Promise<{ hwnd: number, value: string, sent: number }>} 实际发出的按键数。
+ */
+/**
+ * 在 VESTA 界面里删除原子列表中的一行（默认第 1 行）。
+ *
+ * 实测边界（0.0.41）：
+ *   1. `Edit Data` 里有 6 个 `wxDataView`，其中 **5 个 visible=false**——必须先按 visible 过滤，
+ *      否则真实点击落在隐藏表上，什么都不会发生（这是之前反复失败的原因）；
+ *   2. **行选中不接受 PostMessage**（投递鼠标/键盘都不选中），只能用真实点击（SendInput 兜底）；
+ *   3. 选中后点 `Delete`、再点 `&Apply` / `&OK` 都可以用 PostMessage。
+ * @param {number} pid - VESTA 进程。
+ * @param {{ row?: number }} [options] - row 为从 0 开始的行号，默认 0。
+ * @returns {Promise<{ ok: boolean, steps: string[] }>} 步骤日志。
+ */
+export async function deleteAtomInVesta(pid, options = {}) {
+  const row = Number.isInteger(options.row) ? Math.max(0, options.row) : 0
+  const target = { pid: Number(pid) }
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const steps = []
+  const findButton = (controls, pattern) => controls.find((item) => String(item.class) === 'Button' && pattern.test(String(item.text)))
+
+  await invokeCommand(117, target)
+  await pause(2500)
+  const dialog = await listControls('dialog')
+  steps.push('打开 Edit Data 对话框')
+
+  const views = dialog.controls.filter((item) => /wxDataView/i.test(String(item.class)))
+  const pick = await pickVisibleAtomGrid(views.map((item) => item.hwnd))
+  if (!pick) throw new Error('找不到可见的原子列表控件')
+  steps.push('原子列表 hwnd=' + pick.hwnd + '（top=' + pick.top + '）')
+
+  // 选中第 row 行：**纯投递点击**（不抢前台、不动光标）。
+  // 关键前提：必须挑 visible=true 的表——6 个 wxDataView 里 5 个是隐藏的，点隐藏表毫无反应。
+  await callUiHost({ action: 'clickat', hwnd: pick.hwnd, x: 40, y: 14 + row * 24 })
+  await pause(500)
+  steps.push('投递点击选中第 ' + (row + 1) + ' 行（纯消息，未抢前台）')
+
+  const deletes = dialog.controls.filter((item) => String(item.class) === 'Button' && /^Delete$/i.test(String(item.text).trim()))
+  const rects = await controlRects(deletes.map((item) => item.hwnd))
+  const nearest = rects.sort((a, b) => Math.abs(a.top - pick.top) - Math.abs(b.top - pick.top))[0]
+  if (!nearest) throw new Error('找不到 Delete 按钮')
+  await callUiHost({ action: 'clickpost', hwnd: nearest.hwnd })
+  await pause(1200)
+  steps.push('点 Delete（hwnd=' + nearest.hwnd + '，投递）')
+
+  const apply = findButton(dialog.controls, /^&?Apply$/)
+  if (apply) {
+    await callUiHost({ action: 'clickpost', hwnd: apply.hwnd })
+    await pause(1800)
+    steps.push('点 &Apply')
+  }
+  const reopened = await listControls('dialog').catch(() => null)
+  if (reopened?.controls) {
+    const ok = findButton(reopened.controls, /^&?OK$/)
+    if (ok) {
+      await callUiHost({ action: 'clickpost', hwnd: ok.hwnd })
+      await pause(1800)
+      steps.push('点 &OK')
+    }
+  }
+
+  return { ok: true, steps }
+}
+
+/** 从一批 hwnd 里挑出「可见且够宽」的原子列表控件，并返回它的位置。 */
+async function pickVisibleAtomGrid(hwnds) {
+  const rects = await controlRects(hwnds)
+  const candidates = rects
+    .filter((item) => item.visible && item.width > 400)
+    .sort((a, b) => b.width * b.height - a.width * a.height)
+  return candidates[0] ?? null
+}
+
+/** 取一组 hwnd 的屏幕矩形与可见性（走常驻宿主的 rect 动作）。 */
+async function controlRects(hwnds) {
+  const list = (Array.isArray(hwnds) ? hwnds : []).map((h) => Number(h)).filter((h) => Number.isInteger(h) && h > 0)
+  if (list.length === 0) return []
+  const result = await callUiHost({ action: 'rect', hwnds: list }).catch(() => null)
+  const rects = Array.isArray(result?.rects) ? result.rects : []
+  return rects.map((item) => ({
+    hwnd: Number(item.hwnd), left: Number(item.left), top: Number(item.top),
+    width: Number(item.width), height: Number(item.height), visible: Boolean(item.visible),
+  })).filter((item) => item.width > 0 && item.height > 0)
+}
+/**
+ * 在 VESTA 界面里完成 Unit Cell Transformation（**纯 PostMessage，后台执行，不抢焦点、不动光标**）。
+ *
+ * 实测要点（0.0.40 补齐）：
+ *   1. 对**可见**的矩阵输入框用 `WM_SETTEXT` 完全有效（此前“WM_SETTEXT 无效”是因为打到了隐藏控件）；
+ *   2. 焦点顺序是交错的：`P11,P12,P13,p1, P21,P22,P23,p2, P31,P32,P33,p3`；
+ *   3. 点 OK 后会弹 `Warning !`（“changes the unit cell volume, continue?”），**必须点“是”**；
+ *   4. 随后还会弹 `Additional lattice point(s) are included in the new unit-cell`，点 OK；
+ *   5. 最后在 Edit Data 对话框点 `&Apply` 与 `&OK`，结构才真正替换。
+ * @param {number} pid - VESTA 进程。
+ * @param {number[][]} matrix - 3×3 整数变换矩阵（语义同 VESTA 的 P）。
+ * @returns {Promise<{ ok: boolean, steps: string[], matrix: number[][] }>} 每一步做了什么。
+ */
+export async function transformCellInVesta(pid, matrix) {
+  const value = Array.isArray(matrix) && matrix.length === 3 ? matrix.flat().map(Number) : null
+  if (!value || value.length !== 9 || value.some((item) => !Number.isInteger(item))) {
+    throw new Error('matrix 必须是 3×3 整数矩阵')
+  }
+  const target = { pid: Number(pid) }
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const steps = []
+  const findButton = (controls, pattern) => controls.find((item) => String(item.class) === 'Button' && pattern.test(String(item.text)))
+
+  // 1) Edit Data Structure Parameters
+  await invokeCommand(117, target)
+  await pause(2500)
+  const editData = await listControls('dialog')
+  const transformButton = findButton(editData.controls, /Transform/i)
+  if (!transformButton) throw new Error('找不到 Transform... 按钮')
+  await callUiHost({ action: 'clickpost', hwnd: transformButton.hwnd })
+  steps.push('打开 Transform 对话框')
+  await pause(1800)
+
+  // 2) 按「焦点顺序」用 WM_SETTEXT 填矩阵与平移向量
+  const dialog = await listControls('dialog')
+  const fields = dialog.controls.filter((item) => String(item.class).toLowerCase() === 'edit' && item.visible !== false)
+  if (fields.length < 9) throw new Error('矩阵输入框数量不对：' + fields.length)
+  const p = [0, 0, 0]
+  const order = []
+  for (let row = 0; row < 3; row += 1) {
+    order.push(String(value[row * 3]), String(value[row * 3 + 1]), String(value[row * 3 + 2]), p[row].toFixed(6))
+  }
+  for (let index = 0; index < Math.min(fields.length, order.length); index += 1) {
+    // 关键：先投递一次鼠标点击把焦点给到这个输入框（PostMessage，不置前、不动光标），
+    // 否则 wx 只处理「当前有焦点」那个框的 WM_SETTEXT，结果只有第一格生效。
+    await callUiHost({ action: 'clickat', hwnd: fields[index].hwnd, x: 5, y: 5 })
+    await pause(80)
+    await callUiHost({ action: 'settext', hwnd: fields[index].hwnd, text: order[index] })
+    await pause(100)
+  }
+  steps.push('填入矩阵 ' + value.join(',') + '（12 个字段，投递点击 + WM_SETTEXT，未抢前台）')
+  await pause(300)
+
+  // 3) 提交：OK → Warning(是) → Additional lattice points(OK) → &Apply → &OK
+  const okButton = findButton(dialog.controls, /^OK$/)
+  if (!okButton) throw new Error('找不到 Transform 对话框的 OK')
+  await callUiHost({ action: 'clickpost', hwnd: okButton.hwnd })
+  steps.push('点 Transform OK')
+  await pause(1800)
+
+  const handled = new Set()
+  for (let round = 0; round < 6; round += 1) {
+    const current = await listControls('dialog').catch(() => null)
+    if (!current?.controls) break
+    const candidates = [
+      findButton(current.controls, /^(是|Yes|是\(&Y\))/),
+      findButton(current.controls, /^&?Apply$/),
+      findButton(current.controls, /^&?OK$|^OK$/),
+    ].filter(Boolean)
+    // 关键：要选「还没点过」的那个，否则点完 Apply 会一直卡在同一个按钮上
+    const choice = candidates.find((item) => !handled.has(current.window.title + "/" + String(item.text).trim()))
+    if (!choice) break
+    const key = current.window.title + "/" + String(choice.text).trim()
+    handled.add(key)
+    await callUiHost({ action: 'clickpost', hwnd: choice.hwnd })
+    steps.push('点「' + String(choice.text).trim() + '」（对话框：' + current.window.title + '）')
+    await pause(1600)
+  }
+
+  return { ok: true, steps, matrix: [value.slice(0, 3), value.slice(3, 6), value.slice(6, 9)] }
+}
+
+/**
+ * 按「Tab 焦点顺序」连续填一串数值（对话框里逐格点击不可靠时用这个）。
+ *
+ * 实测 VESTA 的 Unit Cell Transformation 对话框，焦点顺序是**每个矩阵行后跟一个平移分量**：
+ * P11, P12, P13, p1, P21, P22, P23, p2, P31, P32, P33, p3。
+ * 用「点进第一格 → Ctrl+A → 输入 → Tab」的方式填，值会严格按这个顺序落位（有截图为证）。
+ * @param {number} firstFieldHwnd - 第一格的窗口句柄。
+ * @param {Array<string|number>} values - 按焦点顺序排列的数值。
+ * @returns {Promise<{ filled: number, order: string[] }>} 填入个数与顺序说明。
+ */
+export async function fillDialogFieldsInTabOrder(firstFieldHwnd, values) {
+  const target = Number(firstFieldHwnd)
+  const list = Array.isArray(values) ? values : []
+  if (list.length === 0) throw new Error('values 不能为空')
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  // 同样保存/还原光标与前台，减少对用户的干扰
+  const saved = await callUiHost({ action: 'saveenv' }).then((r) => r?.state ?? null).catch(() => null)
+  try {
+  // 置前后点两次：窗口不在前台时第一次点击只激活窗口
+  await callUiHost({ action: 'foreground', hwnd: target })
+  await pause(250)
+  await callUiHost({ action: 'realmouse', hwnd: target })
+  await pause(200)
+  await callUiHost({ action: 'realmouse', hwnd: target })
+  await pause(200)
+  for (let index = 0; index < list.length; index += 1) {
+    const text = String(list[index]).trim()
+    if (!/^-?\d+(\.\d+)?$/.test(text)) throw new Error('只支持普通十进制数字：' + text)
+    await callUiHost({ action: 'chord', hwnd: target, modifier: 0x11, key: 0x41 })
+    await pause(100)
+    const vks = []
+    for (const char of text) {
+      if (char >= '0' && char <= '9') vks.push(48 + Number(char))
+      else if (char === '-') vks.push(0xbd)
+      else if (char === '.') vks.push(0xbe)
+    }
+    await callUiHost({ action: 'vk', hwnd: target, vks })
+    await pause(120)
+    // 最后一格不再 Tab（避免把焦点推出对话框）
+    if (index < list.length - 1) {
+      await callUiHost({ action: 'vk', hwnd: target, vks: [0x09] })
+      await pause(120)
+    }
+  }
+  return { filled: list.length, order: list.map((value) => String(value)) }
+  } finally {
+    if (saved) await callUiHost({ action: 'restoreenv', state: saved }).catch(() => null)
+  }
+}
+
+/**
+ * 在控件的指定客户坐标处做一次**真实鼠标点击**（SendInput 兜底）。
+ *
+ * 为什么要它：VESTA 的 `wxDataView`（原子列表）不接受 PostMessage 的点击（行不会选中），
+ * 只能真点。按「PostMessage 优先、SendInput 兜底」的策略，这里只在必要时使用，
+ * 并且**自动保存/还原光标位置与前台窗口**，把对用户的干扰压到最低。
+ * @param {number} hwnd - 目标控件（或窗口）的 hwnd。
+ * @param {number} x - 客户区 x。
+ * @param {number} y - 客户区 y。
+ * @returns {Promise<{ ok: boolean, screenX?: number, screenY?: number }>} 点击结果。
+ */
+/**
+ * 在控件内做一次**真实鼠标拖拽**（框选原子用）。
+ *
+ * 与 realClickControlAt 一样会保存/还原光标与前台窗口；只在 PostMessage 无效的拖拽类交互上使用。
+ * @param {number} hwnd - 目标控件（画布）。
+ * @param {number} x1 - 起点客户区 x。
+ * @param {number} y1 - 起点客户区 y。
+ * @param {number} x2 - 终点客户区 x。
+ * @param {number} y2 - 终点客户区 y。
+ * @returns {Promise<{ ok: boolean }>} 是否成功。
+ */
+/**
+ * 真实按键（SendInput 兜底）：先置前再按，结束后还原光标与前台窗口。
+ *
+ * 用在「投递按键无效」的地方，例如 VESTA 里框选原子后按 Delete 删除。
+ * @param {number} hwnd - 目标窗口（任意子窗口，内部会取根窗口）。
+ * @param {number} vk - 虚拟键码。
+ * @param {{ count?: number }} [options] - 连按次数，默认 1。
+ * @returns {Promise<{ ok: boolean }>} 是否成功。
+ */
+/**
+ * **固定几何 + 自校验**的完整窗口截图（以后截图都走这里）。
+ *
+ * 为什么之前截不稳：窗口被别的窗口遮挡时 `CopyFromScreen` 会抓到别人的画面；
+ * `GetWindowRect` 有时拿到子控件；窗口最小化时全是空白。
+ * 这个函数做四件事：
+ *   1. 用进程的 `MainWindowHandle` 找**顶层**窗口（不猜）；
+ *   2. 恢复到固定几何（默认 1280×900 @ 10,10），保证每次截图一致；
+ *   3. 优先 `PrintWindow(PW_RENDERFULLCONTENT)`（被遮挡也能抓），空白则退回屏幕抓取；
+ *   4. 用“着墨率”自校验，并把 method/size/ink 一起返回。
+ * @param {number} pid - VESTA 进程。
+ * @param {string} out - 输出 PNG 路径。
+ * @param {{ width?: number, height?: number, x?: number, y?: number }} [options] - 几何参数。
+ * @returns {Promise<{ ok: boolean, method?: string, width?: number, height?: number, ink?: number, out?: string }>} 截图结果。
+ */
+export async function captureFullWindow(pid, out, options = {}) {
+  const width = Number.isInteger(options.width) ? options.width : 1280
+  const height = Number.isInteger(options.height) ? options.height : 900
+  const x = Number.isInteger(options.x) ? options.x : 10
+  const y = Number.isInteger(options.y) ? options.y : 10
+  const got = spawnSync('powershell.exe', ['-NoProfile', '-Command',
+    `(Get-Process -Id ${Number(pid)} -ErrorAction SilentlyContinue).MainWindowHandle`],
+    { encoding: 'utf8', windowsHide: true, timeout: 20000 })
+  const hwnd = Number(String(got.stdout ?? '').trim())
+  if (!hwnd) return { ok: false, error: '找不到主窗口' }
+  const script = join(dirname(fileURLToPath(import.meta.url)), 'win', 'shot.ps1')
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
+    '-Hwnd', String(hwnd), '-Out', out, '-Width', String(width), '-Height', String(height),
+    '-X', String(x), '-Y', String(y)],
+    { encoding: 'utf8', windowsHide: true, timeout: 60000 })
+  const raw = String(result.stdout ?? '').trim()
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return { ok: false, error: raw.slice(0, 200) || '截图脚本无输出' }
+  }
+}
+
+export async function realKeyPress(hwnd, vk, options = {}) {
+  const count = Number.isInteger(options.count) ? Math.max(1, options.count) : 1
+  const saved = await callUiHost({ action: 'saveenv' }).then((result) => result?.state ?? null).catch(() => null)
+  try {
+    const result = await callUiHost({ action: 'realkey', hwnd: Number(hwnd), key: Number(vk), count })
+    return { ok: Boolean(result?.ok) }
+  } finally {
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    if (saved) await callUiHost({ action: 'restoreenv', state: saved }).catch(() => null)
+  }
+}
+
+export async function realDragOnControl(hwnd, x1, y1, x2, y2) {
+  const saved = await callUiHost({ action: 'saveenv' }).then((result) => result?.state ?? null).catch(() => null)
+  try {
+    const result = await callUiHost({ action: 'realdrag', hwnd: Number(hwnd), x1: Math.round(x1), y1: Math.round(y1), x2: Math.round(x2), y2: Math.round(y2) })
+    return { ok: Boolean(result?.ok) }
+  } finally {
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    if (saved) await callUiHost({ action: 'restoreenv', state: saved }).catch(() => null)
+  }
+}
+
+export async function realClickControlAt(hwnd, x, y, options = {}) {
+  const modifier = Number.isInteger(options.modifier) ? options.modifier : 0
+  const saved = await callUiHost({ action: 'saveenv' }).then((result) => result?.state ?? null).catch(() => null)
+  try {
+    const result = await callUiHost({ action: 'realclickat', hwnd: Number(hwnd), x: Math.round(Number(x)), y: Math.round(Number(y)), modifier })
+    return { ok: Boolean(result?.ok), screenX: result?.screenX, screenY: result?.screenY, modifier }
+  } finally {
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    if (saved) await callUiHost({ action: 'restoreenv', state: saved }).catch(() => null)
+  }
+}
+
+export async function fillControlNumber(hwnd, value) {
+  const text = String(value).trim()
+  if (!/^-?\d+(\.\d+)?$/.test(text)) throw new Error('只支持普通十进制数字：' + value)
+  const target = Number(hwnd)
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  // 真输入会挪动光标、抢占前台；先记下来，结束时还原，尽量不干扰用户
+  const saved = await callUiHost({ action: 'saveenv' }).then((r) => r?.state ?? null).catch(() => null)
+  try {
+  // 1) 先置前：窗口不在前台时，第一次点击只会「激活窗口」，不会传给控件（Windows 的防误触行为）
+  await callUiHost({ action: 'foreground', hwnd: target })
+  await pause(200)
+  // 2) 点两次：第一次确保激活/聚焦，第二次落到字段里
+  await callUiHost({ action: 'realmouse', hwnd: target })
+  await pause(200)
+  await callUiHost({ action: 'realmouse', hwnd: target })
+  await pause(250)
+  // 3) Ctrl+A 必须是和弦（按下 Ctrl → 按 A → 抬起 A → 抬起 Ctrl）；分开发会把 "a" 当文字打进去
+  await callUiHost({ action: 'chord', hwnd: target, modifier: 0x11, key: 0x41 })
+  await pause(150)
+  // 4) 逐字符映射成虚拟键码（布局无关）
+  const vks = []
+  for (const char of text) {
+    if (char >= '0' && char <= '9') vks.push(48 + Number(char))
+    else if (char === '-') vks.push(0xbd)
+    else if (char === '.') vks.push(0xbe)
+    else throw new Error('不支持的字符：' + char)
+  }
+  const result = await callUiHost({ action: 'vk', hwnd: target, vks })
+  await pause(150)
+  return { hwnd: target, value: text, sent: Number(result?.sent ?? vks.length) }
+  } finally {
+    if (saved) await callUiHost({ action: 'restoreenv', state: saved }).catch(() => null)
+  }
+}
+/**
+ * 结构变换：按整数矩阵 P 生成新晶胞（VESTA 的 Unit Cell Transformation 语义）。
+ * 新基矢 = P · 旧基矢；原子数变为 |det(P)| 倍。
+ * @param {{ a1: number[], a2: number[], a3: number[], atoms: Array<{ symbol: string, frac: number[] }> }} structure - 输入结构。
+ * @param {number[][]} matrix - 3×3 整数矩阵。
+ * @returns {{ a1: number[], a2: number[], a3: number[], atoms: Array<{ symbol: string, frac: number[] }>, determinant: number }}
+ */
+export function transformStructure(structure, matrix) {
+  if (!Array.isArray(matrix) || matrix.length !== 3 || matrix.some((row) => !Array.isArray(row) || row.length !== 3)) {
+    throw new Error('matrix 必须是 3×3 数组')
+  }
+  const P = matrix.map((row) => row.map((value) => {
+    const number = Number(value)
+    if (!Number.isInteger(number)) throw new Error('matrix 的元素必须是整数（分数变换请先乘公倍数）')
+    return number
+  }))
+  const det = P[0][0] * (P[1][1] * P[2][2] - P[1][2] * P[2][1])
+    - P[0][1] * (P[1][0] * P[2][2] - P[1][2] * P[2][0])
+    + P[0][2] * (P[1][0] * P[2][1] - P[1][1] * P[2][0])
+  if (det === 0) throw new Error('matrix 的行列式为 0，无法构成新晶胞')
+  const n = Math.abs(det)
+  if (n > 1000) throw new Error('变换后原子数 ' + n + ' 倍，超过 1000 倍上限')
+
+  const A = [structure.a1, structure.a2, structure.a3]
+  const newA = P.map((row) => [
+    row[0] * A[0][0] + row[1] * A[1][0] + row[2] * A[2][0],
+    row[0] * A[0][1] + row[1] * A[1][1] + row[2] * A[2][1],
+    row[0] * A[0][2] + row[1] * A[1][2] + row[2] * A[2][2],
+  ])
+  const inv = invert3(newA)
+
+  const atoms = []
+  const span = Math.max(...P.flat().map((value) => Math.abs(value))) + 2
+  for (const atom of structure.atoms) {
+    const seen = new Set()
+    let found = 0
+    for (let i = -span; i <= span && found < n; i += 1) {
+      for (let j = -span; j <= span && found < n; j += 1) {
+        for (let k = -span; k <= span && found < n; k += 1) {
+          const cart = [
+            A[0][0] * (atom.frac[0] + i) + A[1][0] * (atom.frac[1] + j) + A[2][0] * (atom.frac[2] + k),
+            A[0][1] * (atom.frac[0] + i) + A[1][1] * (atom.frac[1] + j) + A[2][1] * (atom.frac[2] + k),
+            A[0][2] * (atom.frac[0] + i) + A[1][2] * (atom.frac[1] + j) + A[2][2] * (atom.frac[2] + k),
+          ]
+          const frac = [
+            inv[0][0] * cart[0] + inv[1][0] * cart[1] + inv[2][0] * cart[2],
+            inv[0][1] * cart[0] + inv[1][1] * cart[1] + inv[2][1] * cart[2],
+            inv[0][2] * cart[0] + inv[1][2] * cart[1] + inv[2][2] * cart[2],
+          ].map((value) => {
+            // 先取小数部分再夹紧：直接对 value+ε 取 floor 会留下 -2.2e-16 这种负零毛刺
+            let wrapped = value - Math.floor(value)
+            if (wrapped < 1e-9 || wrapped > 1 - 1e-9) wrapped = 0
+            return wrapped
+          })
+          const key = frac.map((value) => value.toFixed(6)).join(',')
+          if (seen.has(key)) continue
+          seen.add(key)
+          atoms.push({ ...atom, symbol: atom.symbol, frac })
+          found += 1
+          if (found >= n) break
+        }
+      }
+    }
+    if (found !== n) throw new Error('矩阵变换未能为原子 ' + atom.symbol + ' 生成 ' + n + ' 个像')
+  }
+  return { a1: newA[0], a2: newA[1], a3: newA[2], atoms, determinant: det }
+}
+
+
+/**
+ * 替换元素（同位置换）。
+ * @param {object} structure - 结构。
+ * @param {string} from - 要替换的元素符号。
+ * @param {string} to - 新元素符号。
+ * @returns {{ structure: object, replaced: number }}
+ */
+export function substituteElement(structure, from, to) {
+  const fromSymbol = String(from ?? '').trim()
+  const toSymbol = String(to ?? '').trim()
+  if (!fromSymbol || !toSymbol) throw new Error('substitute 需要 from 与 to 两个元素符号')
+  let replaced = 0
+  const atoms = structure.atoms.map((atom) => {
+    if (atom.symbol !== fromSymbol) return atom
+    replaced += 1
+    return { ...atom, symbol: toSymbol }
+  })
+  return { structure: { ...structure, atoms }, replaced }
+}
+
+/**
+ * 写出 VASP 5 格式 POSCAR。
+ * @param {{ a1: number[], a2: number[], a3: number[], atoms: Array<{ symbol: string, frac: number[] }> }} structure - 结构。
+ * @param {string} [title] - 第一行标题。
+ * @returns {string} POSCAR 文本。
+ */
+export function structureToPoscar(structure, title = 'structure') {
+  const symbols = []
+  for (const atom of structure.atoms) if (!symbols.includes(atom.symbol)) symbols.push(atom.symbol)
+  const lines = [String(title), '1.0000000000']
+  for (const vector of [structure.a1, structure.a2, structure.a3]) {
+    lines.push(vector.map((value) => value.toFixed(10)).join('  '))
+  }
+  lines.push(symbols.join('  '))
+  lines.push(symbols.map((symbol) => structure.atoms.filter((atom) => atom.symbol === symbol).length).join('  '))
+  lines.push('Direct')
+  for (const symbol of symbols) {
+    for (const atom of structure.atoms.filter((item) => item.symbol === symbol)) {
+      lines.push(atom.frac.map((value) => value.toFixed(10)).join('  '))
+    }
+  }
+  return lines.join('\n') + '\n'
+}
+
+/**
+ * 由晶胞参数（a,b,c,α,β,γ）构造三个晶格矢量。
+ * 约定：a 沿 x 轴、b 在 xy 平面内——与 VESTA/POSCAR 的常规写法一致，且与分数坐标无关。
+ * @param {{ a: number, b: number, c: number, alpha: number, beta: number, gamma: number }} params - 长度 Å、角度度。
+ * @returns {number[][]} `[a1, a2, a3]`。
+ */
+export function latticeFromCellParameters(params) {
+  const a = Number(params.a)
+  const b = Number(params.b)
+  const c = Number(params.c)
+  const alpha = (Number(params.alpha ?? 90) * Math.PI) / 180
+  const beta = (Number(params.beta ?? 90) * Math.PI) / 180
+  const gamma = (Number(params.gamma ?? 90) * Math.PI) / 180
+  for (const [name, value] of [['a', a], ['b', b], ['c', c]]) {
+    if (!Number.isFinite(value) || value <= 0) throw new Error('晶胞参数 ' + name + ' 必须是正数')
+  }
+  const a1 = [a, 0, 0]
+  const a2 = [b * Math.cos(gamma), b * Math.sin(gamma), 0]
+  const cx = c * Math.cos(beta)
+  const cy = (c * (Math.cos(alpha) - Math.cos(beta) * Math.cos(gamma))) / Math.sin(gamma)
+  const czSquared = c * c - cx * cx - cy * cy
+  if (!(czSquared > 0)) throw new Error('这三个角度构成不了合法晶胞（体积为 0）')
+  const a3 = [cx, cy, Math.sqrt(czSquared)]
+  return [a1, a2, a3]
+}
+
+/**
+ * 修改晶胞参数，保持分数坐标不变（等价于 VESTA 的 Edit Data > Unit Cell 里改 a/b/c/α/β/γ）。
+ * @param {object} structure - 结构。
+ * @param {{ a?: number, b?: number, c?: number, alpha?: number, beta?: number, gamma?: number }} params - 只给要改的项。
+ * @returns {{ structure: object, cell: object }}
+ */
+export function setCellParameters(structure, params) {
+  const current = cellParameters([structure.a1, structure.a2, structure.a3])
+  const merged = {
+    a: params.a ?? current.a,
+    b: params.b ?? current.b,
+    c: params.c ?? current.c,
+    alpha: params.alpha ?? current.alpha,
+    beta: params.beta ?? current.beta,
+    gamma: params.gamma ?? current.gamma,
+  }
+  const [a1, a2, a3] = latticeFromCellParameters(merged)
+  return { structure: { ...structure, a1, a2, a3 }, cell: merged }
+}
+
+/**
+ * 删除原子：按索引（0 基）或按元素符号。
+ * @param {object} structure - 结构。
+ * @param {{ indexes?: number[], species?: string }} options - indexes 与 species 至少给一个。
+ * @returns {{ structure: object, removed: number }} 删除后的结构与删除数量。
+ */
+export function removeAtoms(structure, options = {}) {
+  const indexes = new Set((options.indexes ?? []).map((value) => Number(value)))
+  const species = options.species ? String(options.species) : null
+  if (indexes.size === 0 && !species) throw new Error('remove 需要 indexes 或 species')
+  const atoms = []
+  let removed = 0
+  structure.atoms.forEach((atom, index) => {
+    if (indexes.has(index) || (species && atom.symbol === species)) {
+      removed += 1
+      return
+    }
+    atoms.push(atom)
+  })
+  if (removed === 0) throw new Error('没有匹配到要删除的原子（索引从 0 开始）')
+  return { structure: { ...structure, atoms }, removed }
+}
+
+/**
+ * 追加原子。
+ * @param {object} structure - 结构。
+ * @param {Array<{ symbol: string, frac: number[] }>} atoms - 要追加的原子（分数坐标）。
+ * @returns {{ structure: object, added: number }} 追加后的结构与数量。
+ */
+export function addAtoms(structure, atoms) {
+  if (!Array.isArray(atoms) || atoms.length === 0) throw new Error('add 需要 atoms 数组')
+  const appended = atoms.map((atom) => {
+    const symbol = String(atom.symbol ?? '').trim()
+    if (!symbol) throw new Error('每个新原子都要有 symbol')
+    const frac = (atom.frac ?? []).map(Number)
+    if (frac.length !== 3 || frac.some((value) => !Number.isFinite(value))) {
+      throw new Error('原子 ' + symbol + ' 的 frac 必须是三个数字')
+    }
+    return { symbol, frac: frac.map((value) => {
+      let wrapped = value - Math.floor(value)
+      if (wrapped < 1e-9 || wrapped > 1 - 1e-9) wrapped = 0
+      return wrapped
+    }) }
+  })
+  return { structure: { ...structure, atoms: [...structure.atoms, ...appended] }, added: appended.length }
+}
+
+/**
+ * 解析 VESTA 的 spgra.dat（空间群与对称操作表）。
+ * 行格式：`<number> <setting> <15> <flag> <opCount> <symbol...>`，紧跟一行无关键，
+ * 然后是 opCount 条操作（如 `-x+1/2,y+1/2,-z`）。
+ * @param {string} text - spgra.dat 内容。
+ * @returns {Map<number, { symbol: string, ops: string[][], matrices: number[][][] }>} 群号 → 操作。
+ */
+export function parseSpaceGroupTable(text) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  const groups = new Map()
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(lines[index])
+    if (!header) continue
+    const number = Number(header[1])
+    const count = Number(header[5])
+    const symbol = header[6].replace(/\s+/g, ' ').trim()
+    // 跳过「代码」行，然后读 count 条操作
+    const ops = []
+    for (let cursor = index + 2; cursor < lines.length && ops.length < count; cursor += 1) {
+      const line = lines[cursor].trim()
+      if (!line) continue
+      // 撞到下一个表头就说明这一块不完整，停止（否则会把下一块的操作混进来）
+      if (/^\d+\s+\d+\s+\d+\s+\d+\s+\d+\s/.test(line)) break
+      if (/^[xyzXYZ+\-]/.test(line)) ops.push(line)
+    }
+    if (ops.length === count) {
+      // 同号多设置时保留第一块（标准设置通常是 P 型）；后面的 A/B/C/I/F/R 不覆盖
+      if (!groups.has(number) || groups.get(number).symbol.charAt(0) !== 'P') {
+      if (!groups.has(number)) groups.set(number, {
+        symbol,
+        ops,
+        matrices: ops.map((op) => symmetryOperationToMatrix(op)),
+      })
+      }
+      index += 1 + count
+    }
+  }
+  return groups
+}
+
+/**
+ * 把 `-x+1/2,y+1/2,-z` 这样的对称操作转成 3×4 增广矩阵。
+ * @param {string} operation - 操作字符串（逗号分隔三个表达式）。
+ * @returns {number[][]} `[[m11,m12,m13,t1],[...],[...]]`。
+ */
+export function symmetryOperationToMatrix(operation) {
+  // spgra.dat 里有的操作行以逗号结尾（如 `x,-z,-y+1/2,`），要先去掉尾随逗号
+  const cleaned = String(operation ?? '').replace(/\s+/g, '').replace(/,+$/, '')
+  const expressions = cleaned.split(',').filter((item) => item.length > 0)
+  if (expressions.length !== 3) throw new Error('对称操作必须有三段：' + operation)
+  const axes = ['x', 'y', 'z']
+  return expressions.map((raw) => {
+    let expression = raw.replace(/\s+/g, '')
+    if (!/^[+-]/.test(expression)) expression = '+' + expression
+    const row = [0, 0, 0, 0]
+    const terms = expression.match(/[+-][^+-]+/g) ?? []
+    let matched = false
+    for (const term of terms) {
+      const sign = term[0] === '-' ? -1 : 1
+      const body = term.slice(1).toLowerCase()
+      const axisIndex = axes.indexOf(body)
+      if (axisIndex >= 0) {
+        row[axisIndex] += sign
+        matched = true
+        continue
+      }
+      const fraction = /^(\d+)\/(\d+)$/.exec(body)
+      if (fraction) {
+        row[3] += (sign * Number(fraction[1])) / Number(fraction[2])
+        matched = true
+        continue
+      }
+      const decimal = Number(body)
+      if (Number.isFinite(decimal)) {
+        row[3] += sign * decimal
+        matched = true
+      }
+    }
+    if (!matched) throw new Error('无法解析对称操作片段：' + raw)
+    return row
+  })
+}
+
+/**
+ * 由晶体学符号的首字母给出点阵平移（spgra.dat 只存点群操作，不含这些平移）。
+ * @param {string} symbol - 空间群符号，如 "F m -3 m"。
+ * @returns {number[][]} 平移向量列表（分数坐标）。
+ */
+export function centeringTranslations(symbol) {
+  const letter = String(symbol ?? '').trim().charAt(0).toUpperCase()
+  switch (letter) {
+    case 'A': return [[0, 0, 0], [0, 0.5, 0.5]]
+    case 'B': return [[0, 0, 0], [0.5, 0, 0.5]]
+    case 'C': return [[0, 0, 0], [0.5, 0.5, 0]]
+    case 'I': return [[0, 0, 0], [0.5, 0.5, 0.5]]
+    case 'F': return [[0, 0, 0], [0, 0.5, 0.5], [0.5, 0, 0.5], [0.5, 0.5, 0]]
+    case 'R': return [[0, 0, 0], [2 / 3, 1 / 3, 1 / 3], [1 / 3, 2 / 3, 2 / 3]]
+    default: return [[0, 0, 0]]
+  }
+}
+
+/**
+ * 按空间群把不对称单元展开成完整晶胞（等价于 VESTA 的「Apply symmetry operations」）。
+ * @param {object} structure - `{a1,a2,a3,atoms}`，原子是分数坐标。
+ * @param {Map|object} table - `parseSpaceGroupTable` 的结果。
+ * @param {number} number - 空间群编号（如 225）。
+ * @param {number} [tolerance] - 去重容差（分数坐标）。
+ * @returns {{ structure: object, symbol: string, generated: number, unique: number }}
+ */
+export function applySymmetry(structure, table, number, tolerance = 1e-4) {
+  const group = table instanceof Map ? table.get(Number(number)) : table?.[Number(number)]
+  if (!group) throw new Error('空间群表里没有编号 ' + number)
+  const atoms = []
+  const seen = new Set()
+  const centers = centeringTranslations(group.symbol)
+  for (const atom of structure.atoms) {
+    for (const shift of centers) {
+    for (const matrix of group.matrices) {
+      const frac = [0, 1, 2].map((rowIndex) => {
+        const row = matrix[rowIndex]
+        let value = row[0] * atom.frac[0] + row[1] * atom.frac[1] + row[2] * atom.frac[2] + row[3] + shift[rowIndex]
+        value -= Math.floor(value)
+        if (value < tolerance || value > 1 - tolerance) value = 0
+        return value
+      })
+      const key = atom.symbol + ':' + frac.map((value) => Math.round(value / tolerance)).join(',')
+      if (seen.has(key)) continue
+      seen.add(key)
+      atoms.push({ symbol: atom.symbol, frac })
+    }
+    }
+  }
+  return {
+    structure: { ...structure, atoms },
+    symbol: group.symbol,
+    generated: group.matrices.length * centers.length * structure.atoms.length,
+    unique: atoms.length,
+  }
+}
+
+/**
+ * 读并缓存 VESTA 自带的 spgra.dat（空间群表）。
+ * @param {string} tablePath - spgra.dat 路径（VESTA 安装目录下）。
+ * @returns {Map<number, object>} 群号 → { symbol, ops, matrices }。
+ */
+let spaceGroupTableCache = null
+let spaceGroupTableCachePath = ''
+
+export function loadSpaceGroupTable(tablePath) {
+  const path = toAbsolute(String(tablePath), process.cwd())
+  if (!existsSync(path)) throw new Error('找不到空间群表：' + path + '（通常位于 VESTA 安装目录）')
+  if (spaceGroupTableCache && spaceGroupTableCachePath === path) return spaceGroupTableCache
+  spaceGroupTableCache = parseSpaceGroupTable(readFileSync(path, 'utf8'))
+  spaceGroupTableCachePath = path
+  return spaceGroupTableCache
+}
+
+/**
+ * 按空间群把不对称单元展开成完整晶胞（VESTA 的「Apply symmetry operations」等价实现）。
+ * @param {object} structure - `{a1,a2,a3,atoms}`。
+ * @param {number} number - 空间群编号（1–230）。
+ * @param {string} tablePath - spgra.dat 路径。
+ * @returns {{ structure: object, symbol: string, generated: number, unique: number }}
+ */
+export function expandBySpaceGroup(structure, number, tablePath) {
+  const table = loadSpaceGroupTable(tablePath)
+  return applySymmetry(structure, table, number)
+}
+
+/**
+ * 求某个原子在给定空间群下的轨道（所有对称等价位置，去重）。
+ * @param {object} atom - `{ symbol, frac }`。
+ * @param {object} group - `parseSpaceGroupTable` 里的一个条目。
+ * @param {number} [tolerance] - 去重容差（分数坐标）。
+ * @returns {Array<{ symbol: string, frac: number[] }>} 轨道成员（含自身）。
+ */
+export function symmetryOrbit(atom, group, tolerance = 1e-4) {
+  const centers = centeringTranslations(group.symbol)
+  const orbit = []
+  const seen = new Set()
+  for (const shift of centers) {
+    for (const matrix of group.matrices) {
+      const frac = [0, 1, 2].map((rowIndex) => {
+        const row = matrix[rowIndex]
+        let value = row[0] * atom.frac[0] + row[1] * atom.frac[1] + row[2] * atom.frac[2] + row[3] + shift[rowIndex]
+        value -= Math.floor(value)
+        if (value < tolerance || value > 1 - tolerance) value = 0
+        return value
+      })
+      const key = frac.map((value) => Math.round(value / tolerance)).join(',')
+      if (seen.has(key)) continue
+      seen.add(key)
+      orbit.push({ symbol: atom.symbol, frac })
+    }
+  }
+  return orbit
+}
+
+/**
+ * 按空间群把完整晶胞约化成不对称单元（VESTA 的「按对称性约化」）。
+ * 每个轨道保留一个代表原子，并报告该轨道的多重度（近似 Wyckoff 多重度）。
+ * @param {object} structure - `{a1,a2,a3,atoms}`。
+ * @param {number} number - 空间群编号。
+ * @param {Map|object} table - `parseSpaceGroupTable` 的结果。
+ * @param {number} [tolerance] - 去重容差。
+ * @returns {{ structure: object, symbol: string, orbits: Array<{ symbol: string, frac: number[], multiplicity: number }> }}
+ */
+export function reduceBySymmetryTable(structure, number, table, tolerance = 1e-4) {
+  const group = table instanceof Map ? table.get(Number(number)) : table?.[Number(number)]
+  if (!group) throw new Error('空间群表里没有编号 ' + number)
+  const keyOf = (atom) => atom.symbol + ':' + atom.frac.map((value) => Math.round(value / tolerance)).join(',')
+  const consumed = new Set()
+  const orbits = []
+  const atoms = []
+  for (const atom of structure.atoms) {
+    const atomKey = keyOf(atom)
+    if (consumed.has(atomKey)) continue
+    const orbit = symmetryOrbit(atom, group, tolerance)
+    for (const member of orbit) consumed.add(keyOf(member))
+    consumed.add(atomKey)
+    atoms.push({ symbol: atom.symbol, frac: atom.frac })
+    orbits.push({ symbol: atom.symbol, frac: atom.frac, multiplicity: orbit.length })
+  }
+  return {
+    structure: { ...structure, atoms },
+    symbol: group.symbol,
+    orbits,
+  }
+}
+
+/**
+ * 按空间群约化（自动读 spgra.dat）。
+ * @param {object} structure - 完整晶胞。
+ * @param {number} number - 空间群编号。
+ * @param {string} tablePath - spgra.dat 路径。
+ * @returns {{ structure: object, symbol: string, orbits: Array<object> }}
+ */
+export function reduceBySpaceGroup(structure, number, tablePath) {
+  const table = loadSpaceGroupTable(tablePath)
+  return reduceBySymmetryTable(structure, number, table)
+}
+
+/** 3×3 旋转（角度制，按 x→y→z 顺序）——与 CLI 的 -rotate_* 语义一致。 */
+function rotationMatrix(rx, ry, rz) {
+  const rad = (degrees) => (Number(degrees) * Math.PI) / 180
+  const cx = Math.cos(rad(rx)); const sx = Math.sin(rad(rx))
+  const cy = Math.cos(rad(ry)); const sy = Math.sin(rad(ry))
+  const cz = Math.cos(rad(rz)); const sz = Math.sin(rad(rz))
+  const Rx = [[1, 0, 0], [0, cx, -sx], [0, sx, cx]]
+  const Ry = [[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]
+  const Rz = [[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]
+  const mul = (a, b) => a.map((row) => [0, 1, 2].map((j) => row.reduce((sum, value, k) => sum + value * b[k][j], 0)))
+  return mul(Rz, mul(Ry, Rx))
+}
+
+const applyRotation = (matrix, vector) => [
+  matrix[0][0] * vector[0] + matrix[0][1] * vector[1] + matrix[0][2] * vector[2],
+  matrix[1][0] * vector[0] + matrix[1][1] * vector[1] + matrix[1][2] * vector[2],
+  matrix[2][0] * vector[0] + matrix[2][1] * vector[1] + matrix[2][2] * vector[2],
+]
+
+/**
+ * 把结构渲染成 SVG 矢量图（正交投影 + 球棍 + 晶胞边框）。
+ * 这是 VESTA「Export Vector Image」的等价实现：VESTA 没有矢量导出的 CLI，但矢量图可以由结构数据直接生成。
+ * @param {object} structure - `{a1,a2,a3,atoms}`。
+ * @param {object} [options] - 渲染参数。
+ * @returns {{ svg: string, atoms: number, bonds: number, width: number, height: number }}
+ */
+export function structureToSvg(structure, options = {}) {
+  const width = Math.max(120, Math.round(Number(options.width ?? 800)))
+  const height = Math.max(120, Math.round(Number(options.height ?? 600)))
+  const rx = Number(options.rx ?? 0)
+  const ry = Number(options.ry ?? 0)
+  const rz = Number(options.rz ?? 0)
+  const showCell = options.showCell !== false
+  const showBonds = options.showBonds !== false
+  const background = String(options.background ?? '#ffffff')
+  const padding = Math.max(8, Number(options.padding ?? 40))
+  const bondTolerance = Number(options.bondTolerance ?? 1.15)
+
+  const A = [structure.a1, structure.a2, structure.a3]
+  const cart = structure.atoms.map((atom) => [0, 1, 2].map((axis) =>
+    atom.frac[0] * A[0][axis] + atom.frac[1] * A[1][axis] + atom.frac[2] * A[2][axis]))
+
+  // 中心取「原子 + 晶胞角点」的整体中心，否则只看原子会让晶胞跑出画布
+  const cellCorners = structure.atoms.length > 0 && showCell
+    ? [0, 1].flatMap((i) => [0, 1].flatMap((j) => [0, 1].map((k) => [0, 1, 2].map((axis) =>
+      i * A[0][axis] + j * A[1][axis] + k * A[2][axis]))))
+    : []
+  const boundsPoints = [...cart, ...cellCorners]
+  const center = [0, 1, 2].map((axis) =>
+    boundsPoints.reduce((sum, point) => sum + point[axis], 0) / Math.max(1, boundsPoints.length))
+  const centered = cart.map((point) => point.map((value, axis) => value - center[axis]))
+
+  const rotation = rotationMatrix(rx, ry, rz)
+  const rotated = centered.map((point) => applyRotation(rotation, point))
+  const rotatedCorners = cellCorners.map((point) => applyRotation(rotation, point.map((value, axis) => value - center[axis])))
+
+  // 缩放：把投影后的 xy 装进画布（留 padding），范围同时考虑原子与晶胞角点
+  const radiusOf = (symbol) => (VIEWER_ELEMENTS[symbol]?.radius ?? 1.0)
+  let minX = Infinity; let maxX = -Infinity; let minY = Infinity; let maxY = -Infinity
+  for (const point of [...rotated, ...rotatedCorners]) {
+    const radius = 1.2
+    minX = Math.min(minX, point[0] - radius); maxX = Math.max(maxX, point[0] + radius)
+    minY = Math.min(minY, point[1] - radius); maxY = Math.max(maxY, point[1] + radius)
+  }
+  if (!Number.isFinite(minX)) { minX = -1; maxX = 1; minY = -1; maxY = 1 }
+  const spanX = Math.max(1e-6, maxX - minX)
+  const spanY = Math.max(1e-6, maxY - minY)
+  const scale = Math.min((width - 2 * padding) / spanX, (height - 2 * padding) / spanY)
+  const project = (point) => [
+    (point[0] - (minX + maxX) / 2) * scale + width / 2,
+    height / 2 - (point[1] - (minY + maxY) / 2) * scale,
+  ]
+
+  // 画布上的球：半径按元素半径缩放；z 用于排序（越近越大、越靠后画）
+  const drawable = structure.atoms.map((atom, index) => {
+    const [x, y] = project(rotated[index])
+    const radius = Math.max(1.5, radiusOf(atom.symbol) * scale * 0.32)
+    return {
+      symbol: atom.symbol,
+      color: VIEWER_ELEMENTS[atom.symbol]?.color ?? '#888888',
+      x, y, z: rotated[index][2] - radius * 0.001, radius,
+      occupancy: atom.occupancy,
+    }
+  }).sort((a, b) => a.z - b.z)
+
+  // 成键：距离在 (r_i + r_j) × tolerance 之内的原子对
+  const bonds = []
+  if (showBonds) {
+    for (let i = 0; i < structure.atoms.length; i += 1) {
+      for (let j = i + 1; j < structure.atoms.length; j += 1) {
+        const distance = Math.hypot(...[0, 1, 2].map((axis) => cart[i][axis] - cart[j][axis]))
+        const limit = (radiusOf(structure.atoms[i].symbol) + radiusOf(structure.atoms[j].symbol)) * bondTolerance
+        if (distance > limit || distance < 1e-6) continue
+        const [x1, y1] = project(rotated[i])
+        const [x2, y2] = project(rotated[j])
+        bonds.push({ x1, y1, x2, y2, z: (rotated[i][2] + rotated[j][2]) / 2, width: Math.max(1, scale * 0.06) })
+      }
+    }
+    bonds.sort((a, b) => a.z - b.z)
+  }
+
+  // 晶胞边框：平行六面体的 12 条棱
+  const cellEdges = []
+  if (showCell && rotatedCorners.length === 8) {
+    const corners = []
+    let cursor = 0
+    for (const i of [0, 1]) for (const j of [0, 1]) for (const k of [0, 1]) {
+      corners.push({ key: `${i}${j}${k}`, point: rotatedCorners[cursor] })
+      cursor += 1
+    }
+    const byKey = new Map(corners.map((corner) => [corner.key, corner.point]))
+    const pairs = [['000', '100'], ['000', '010'], ['000', '001'], ['100', '110'], ['100', '101'],
+      ['010', '110'], ['010', '011'], ['001', '101'], ['001', '011'], ['110', '111'], ['101', '111'], ['011', '111']]
+    for (const [from, to] of pairs) {
+      const a = project(byKey.get(from))
+      const b = project(byKey.get(to))
+      cellEdges.push({ x1: a[0], y1: a[1], x2: b[0], y2: b[1] })
+    }
+  }
+
+  const parts = []
+  parts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`)
+  parts.push(`<rect width="${width}" height="${height}" fill="${background}"/>`)
+  for (const edge of cellEdges) {
+    parts.push(`<line x1="${edge.x1.toFixed(2)}" y1="${edge.y1.toFixed(2)}" x2="${edge.x2.toFixed(2)}" y2="${edge.y2.toFixed(2)}" stroke="#c8c8c8" stroke-width="1"/>`)
+  }
+  for (const bond of bonds) {
+    parts.push(`<line x1="${bond.x1.toFixed(2)}" y1="${bond.y1.toFixed(2)}" x2="${bond.x2.toFixed(2)}" y2="${bond.y2.toFixed(2)}" stroke="#9a9a9a" stroke-width="${bond.width.toFixed(2)}" stroke-linecap="round"/>`)
+  }
+  let partialCount = 0
+  for (const atom of drawable) {
+    // 部分占位：按占位率降低不透明度（VESTA 会用分数球/半透明表示），并在悬停提示里写明
+    const occupancy = typeof atom.occupancy === 'number' && Number.isFinite(atom.occupancy) ? atom.occupancy : 1
+    const opacity = occupancy >= 0.999 ? 0.92 : Math.max(0.18, 0.92 * occupancy)
+    if (occupancy < 0.999) partialCount += 1
+    const label = occupancy >= 0.999 ? atom.symbol : `${atom.symbol} occ=${occupancy.toFixed(3)}`
+    const dash = occupancy >= 0.999 ? '' : ' stroke-dasharray="3 2"'
+    parts.push(`<circle cx="${atom.x.toFixed(2)}" cy="${atom.y.toFixed(2)}" r="${atom.radius.toFixed(2)}" fill="${atom.color}" fill-opacity="${opacity.toFixed(3)}" stroke="#333333" stroke-width="0.6"${dash}><title>${label}</title></circle>`)
+  }
+  parts.push('</svg>')
+  return { svg: parts.join('\n'), atoms: drawable.length, bonds: bonds.length, width, height, partial: partialCount }
+}
+
+/**
+ * 写出 CIF（P1 设置，逐原子列出分数坐标）。
+ * 对应 VESTA 的 Export Data / 格式转换；与 `structureToPoscar` 互补：
+ * 有些下游工具只吃 CIF，而 VESTA 的 `-save` 需要起一个 GUI 进程。
+ * @param {object} structure - `{a1,a2,a3,atoms}`。
+ * @param {{ title?: string }} [options] - 标题（`data_` 名字）。
+ * @returns {string} CIF 文本。
+ */
+/** 由结构算化学式（按元素计数，如 "C20 H68"），写进 CIF 的 _chemical_formula_sum。 */
+function formulaOf(structure) {
+  const counts = new Map()
+  for (const atom of structure.atoms) counts.set(atom.symbol, (counts.get(atom.symbol) ?? 0) + 1)
+  return [...counts.entries()].map(([symbol, count]) => symbol + count).join(' ')
+}
+
+export function structureToCif(structure, options = {}) {
+  const params = cellParameters([structure.a1, structure.a2, structure.a3])
+  const title = String(options.title ?? 'structure').replace(/[^0-9A-Za-z_.-]+/g, '_').slice(0, 60) || 'structure'
+  const lines = [
+    'data_' + title,
+    '',
+    '_audit_creation_method            \'dsh-vesta structureToCif\'',
+    '_chemical_formula_sum             \'' + formulaOf(structure) + '\'',
+    '_cell_length_a                    ' + params.a.toFixed(6),
+    '_cell_length_b                    ' + params.b.toFixed(6),
+    '_cell_length_c                    ' + params.c.toFixed(6),
+    '_cell_angle_alpha                 ' + params.alpha.toFixed(6),
+    '_cell_angle_beta                  ' + params.beta.toFixed(6),
+    '_cell_angle_gamma                 ' + params.gamma.toFixed(6),
+    '_cell_volume                      ' + params.volume.toFixed(6),
+    '',
+    '_symmetry_space_group_name_H-M    \'P 1\'',
+    '_symmetry_Int_Tables_number       1',
+    '',
+    'loop_',
+    '_atom_site_label',
+    '_atom_site_type_symbol',
+    '_atom_site_fract_x',
+    '_atom_site_fract_y',
+    '_atom_site_fract_z',
+    '_atom_site_occupancy',
+  ]
+  const counters = new Map()
+  for (const atom of structure.atoms) {
+    const index = (counters.get(atom.symbol) ?? 0) + 1
+    counters.set(atom.symbol, index)
+    const label = atom.symbol + index
+    lines.push([
+      label.padEnd(6),
+      atom.symbol.padEnd(4),
+      atom.frac[0].toFixed(8).padStart(12),
+      atom.frac[1].toFixed(8).padStart(12),
+      atom.frac[2].toFixed(8).padStart(12),
+      (typeof atom.occupancy === 'number' && Number.isFinite(atom.occupancy)
+        ? atom.occupancy.toFixed(4) : '1.0000'),
+    ].join('  '))
+  }
+  return lines.join('\n') + '\n'
+}
+
+/**
+ * 取一个体数据的二维切片（对应 VESTA 的 2D Data Display / Export Data 的切片导出）。
+ * @param {object} volume - `readVolumeFile` 的结果：`{dims:[nx,ny,nz], values, unit, structure}`。
+ * @param {{ plane?: 'xy'|'yz'|'zx', at?: number }} [options] - 切面与位置（分数坐标，默认 0.5）。
+ * @returns {{ plane: string, at: number, axisLabels: [string, string, string], rows: number, columns: number, values: number[][] }}
+ */
+export function volumeSlice(volume, options = {}) {
+  const plane = String(options.plane ?? 'xy').toLowerCase()
+  if (!['xy', 'yz', 'zx'].includes(plane)) throw new Error('plane 只能是 xy / yz / zx')
+  const [nx, ny, nz] = volume.dims
+  const atFraction = Number.isFinite(Number(options.at)) ? Number(options.at) : 0.5
+  if (atFraction < 0 || atFraction > 1) throw new Error('at 必须在 0–1 之间（分数坐标）')
+  const value = (i, j, k) => volume.values[(k * ny + j) * nx + i]
+
+  if (plane === 'xy') {
+    const k = Math.min(nz - 1, Math.max(0, Math.round(atFraction * (nz - 1))))
+    const rows = []
+    for (let j = 0; j < ny; j += 1) {
+      const row = []
+      for (let i = 0; i < nx; i += 1) row.push(value(i, j, k))
+      rows.push(row)
+    }
+    return { plane, at: atFraction, axisLabels: ['x', 'y', 'z=' + k], rows: ny, columns: nx, values: rows }
+  }
+  if (plane === 'yz') {
+    const i = Math.min(nx - 1, Math.max(0, Math.round(atFraction * (nx - 1))))
+    const rows = []
+    for (let k = 0; k < nz; k += 1) {
+      const row = []
+      for (let j = 0; j < ny; j += 1) row.push(value(i, j, k))
+      rows.push(row)
+    }
+    return { plane, at: atFraction, axisLabels: ['y', 'z', 'x=' + i], rows: nz, columns: ny, values: rows }
+  }
+  const j = Math.min(ny - 1, Math.max(0, Math.round(atFraction * (ny - 1))))
+  const rows = []
+  for (let i = 0; i < nx; i += 1) {
+    const row = []
+    for (let k = 0; k < nz; k += 1) row.push(value(i, j, k))
+    rows.push(row)
+  }
+  return { plane, at: atFraction, axisLabels: ['z', 'x', 'y=' + j], rows: nx, columns: nz, values: rows }
+}
+
+/**
+ * 把切片写成 CSV（第一列是第一坐标索引，表头是第二坐标）。
+ * @param {object} volume - 体数据。
+ * @param {{ plane?: string, at?: number }} [options] - 切面参数。
+ * @returns {string} CSV 文本。
+ */
+export function volumeSliceCsv(volume, options = {}) {
+  const slice = volumeSlice(volume, options)
+  const header = [slice.axisLabels[0] + '_' + slice.axisLabels[1], ...Array.from({ length: slice.columns }, (_, index) => String(index))]
+  const lines = [header.join(','), '# unit=' + (volume.unit ?? 'unknown'), '# ' + slice.axisLabels[2]]
+  slice.values.forEach((row, index) => {
+    lines.push([String(index), ...row.map((value) => value.toExponential(6))].join(','))
+  })
+  return lines.join('\n') + '\n'
+}
+
+/**
+ * 把线剖面写成 TXT（两列：距离/分数坐标 + 数值）。
+ * @param {object} volume - 体数据。
+ * @param {{ from?: number[], to?: number[], points?: number }} [options] - 线段参数。
+ * @returns {string} 制表符分隔的文本。
+ */
+export function volumeProfileText(volume, options = {}) {
+  const profile = lineProfile(volume, options.from ?? [0, 0, 0], options.to ?? [0.5, 0.5, 0.5], options)
+  const lines = ['# distance(A)\tvalue(' + (volume.unit ?? 'unknown') + ')']
+  for (let index = 0; index < profile.distances.length; index += 1) {
+    lines.push(profile.distances[index].toFixed(6) + '\t' + profile.values[index].toExponential(6))
+  }
+  return lines.join('\n') + '\n'
+}
+
+/**
+ * 把结构投影到画布（与 `structureToSvg` 同一套数学），供「点击拾取 / 测量」使用。
+ * @param {object} structure - `{a1,a2,a3,atoms}`。
+ * @param {object} [options] - `{rx,ry,rz,width,height,padding}`。
+ * @returns {{ width: number, height: number, scale: number, atoms: Array<{index:number,symbol:string,x:number,y:number,radius:number,z:number}>, toPixel: Function }}
+ */
+export function structureProjection(structure, options = {}) {
+  const width = Math.max(120, Math.round(Number(options.width ?? 800)))
+  const height = Math.max(120, Math.round(Number(options.height ?? 600)))
+  const padding = Math.max(8, Number(options.padding ?? 40))
+  const rotation = rotationMatrix(Number(options.rx ?? 0), Number(options.ry ?? 0), Number(options.rz ?? 0))
+  const A = [structure.a1, structure.a2, structure.a3]
+  const cart = structure.atoms.map((atom) => [0, 1, 2].map((axis) =>
+    atom.frac[0] * A[0][axis] + atom.frac[1] * A[1][axis] + atom.frac[2] * A[2][axis]))
+  const cellCorners = [0, 1].flatMap((i) => [0, 1].flatMap((j) => [0, 1].map((k) => [0, 1, 2].map((axis) =>
+    i * A[0][axis] + j * A[1][axis] + k * A[2][axis]))))
+  const bounds = [...cart, ...cellCorners]
+  const center = [0, 1, 2].map((axis) => bounds.reduce((sum, point) => sum + point[axis], 0) / Math.max(1, bounds.length))
+  const rotated = cart.map((point) => applyRotation(rotation, point.map((value, axis) => value - center[axis])))
+  const rotatedCorners = cellCorners.map((point) => applyRotation(rotation, point.map((value, axis) => value - center[axis])))
+
+  const radiusOf = (symbol) => (VIEWER_ELEMENTS[symbol]?.radius ?? 1.0)
+  let minX = Infinity; let maxX = -Infinity; let minY = Infinity; let maxY = -Infinity
+  for (const point of [...rotated, ...rotatedCorners]) {
+    minX = Math.min(minX, point[0] - 1.2); maxX = Math.max(maxX, point[0] + 1.2)
+    minY = Math.min(minY, point[1] - 1.2); maxY = Math.max(maxY, point[1] + 1.2)
+  }
+  if (!Number.isFinite(minX)) { minX = -1; maxX = 1; minY = -1; maxY = 1 }
+  const scale = Math.min((width - 2 * padding) / Math.max(1e-6, maxX - minX), (height - 2 * padding) / Math.max(1e-6, maxY - minY))
+  const toPixel = (point) => [
+    (point[0] - (minX + maxX) / 2) * scale + width / 2,
+    height / 2 - (point[1] - (minY + maxY) / 2) * scale,
+  ]
+  const atoms = structure.atoms.map((atom, index) => {
+    const [x, y] = toPixel(rotated[index])
+    return {
+      index,
+      symbol: atom.symbol,
+      x, y,
+      radius: Math.max(1.5, radiusOf(atom.symbol) * scale * 0.32),
+      z: rotated[index][2],
+    }
+  })
+  return { width, height, scale, atoms, toPixel }
+}
+
+/**
+ * 点击拾取：把画布坐标映射到最近的原子。
+ * @param {object} structure - 结构。
+ * @param {{x:number,y:number,rx?:number,ry?:number,rz?:number,width?:number,height?:number,tolerance?:number}} click - 点击参数。
+ * @returns {{ index: number, symbol: string, distance: number }|null} 命中返回原子，否则 null。
+ */
+export function pickAtom(structure, click) {
+  const projection = structureProjection(structure, click)
+  const tolerance = Number(click.tolerance ?? 1.6)
+  let best = null
+  for (const atom of projection.atoms) {
+    const distance = Math.hypot(atom.x - click.x, atom.y - click.y)
+    if (distance > atom.radius * tolerance) continue
+    if (!best || distance < best.distance) best = { index: atom.index, symbol: atom.symbol, distance }
+  }
+  return best
+}
+
+/**
+ * 量距离：给出若干对原子索引，返回距离与向量。
+ * @param {object} structure - 结构。
+ * @param {Array<[number, number]>} pairs - 原子索引对。
+ * @returns {Array<{ i:number, j:number, distance:number, vector:number[] }>} 每对的距离（Å）。
+ */
+export function measureDistances(structure, pairs) {
+  const A = [structure.a1, structure.a2, structure.a3]
+  const cart = (index) => {
+    const atom = structure.atoms[index]
+    if (!atom) throw new Error('原子索引越界：' + index)
+    return [0, 1, 2].map((axis) => atom.frac[0] * A[0][axis] + atom.frac[1] * A[1][axis] + atom.frac[2] * A[2][axis])
+  }
+  return (pairs ?? []).map(([i, j]) => {
+    const a = cart(Number(i))
+    const b = cart(Number(j))
+    const vector = [0, 1, 2].map((axis) => b[axis] - a[axis])
+    return { i: Number(i), j: Number(j), distance: Math.hypot(...vector), vector }
+  })
+}
+
+/**
+ * 量角度：给出三个原子索引（j 是顶点），返回 ∠ijk（度）。
+ * @param {object} structure - 结构。
+ * @param {Array<[number, number, number]>} triples - 原子索引三元组。
+ * @returns {Array<{ i:number, j:number, k:number, angle:number }>} 角度（度）。
+ */
+export function measureAngles(structure, triples) {
+  const A = [structure.a1, structure.a2, structure.a3]
+  const cart = (index) => {
+    const atom = structure.atoms[index]
+    if (!atom) throw new Error('原子索引越界：' + index)
+    return [0, 1, 2].map((axis) => atom.frac[0] * A[0][axis] + atom.frac[1] * A[1][axis] + atom.frac[2] * A[2][axis])
+  }
+  return (triples ?? []).map(([i, j, k]) => {
+    const a = cart(Number(i)); const b = cart(Number(j)); const c = cart(Number(k))
+    const u = [0, 1, 2].map((axis) => a[axis] - b[axis])
+    const v = [0, 1, 2].map((axis) => c[axis] - b[axis])
+    const cosine = (u[0] * v[0] + u[1] * v[1] + u[2] * v[2])
+      / Math.max(1e-12, Math.hypot(...u) * Math.hypot(...v))
+    return { i: Number(i), j: Number(j), k: Number(k), angle: (Math.acos(Math.min(1, Math.max(-1, cosine))) * 180) / Math.PI }
+  })
+}
+
+/**
+ * 读取 `.vesta` 场景里的显示参数（背景色与显示模型）。
+ * @param {string} text - .vesta 内容。
+ * @returns {{ background: [number,number,number]|null, model: number|null }} 当前值。
+ */
+export function readSceneStyle(text) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  let background = null
+  let model = null
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim()
+    if (line === 'BKGRC') {
+      const numbers = (lines[index + 1] ?? '').trim().split(/\s+/).map(Number)
+      if (numbers.length >= 3 && numbers.slice(0, 3).every(Number.isFinite)) background = numbers.slice(0, 3)
+    }
+    if (/^MODEL\s/.test(line)) {
+      const numbers = line.split(/\s+/).slice(1).map(Number)
+      if (numbers.length >= 1 && Number.isFinite(numbers[0])) model = numbers[0]
+    }
+  }
+  return { background, model }
+}
+
+/**
+ * 修改 `.vesta` 场景的显示参数。
+ *
+ * 只改**实测 VESTA 会认**的字段：`BKGRC`（背景色）与 `STYLE` 的 `MODEL`（显示模型）。
+ * 实测不生效的字段（`ATOMT`/`BONDP` 的颜色、`ATOMP` 的半径）不在这里改——原子颜色来自 VESTA 的
+ * `style.ini` 元素表，改场景文件没用。
+ * @param {string} text - .vesta 内容。
+ * @param {{ background?: number[], model?: number }} options - 要改的项（background 为 [r,g,b] 0–255）。
+ * @returns {string} 修改后的 .vesta 文本。
+ */
+export function applySceneStyle(text, options = {}) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  if (options.background) {
+    const rgb = options.background.map((value) => Math.round(Number(value)))
+    if (rgb.length !== 3 || rgb.some((value) => !(value >= 0 && value <= 255))) {
+      throw new Error('background 必须是三个 0–255 的整数')
+    }
+    const index = lines.findIndex((line) => line.trim() === 'BKGRC')
+    if (index < 0) throw new Error('场景里没有 BKGRC 段，无法改背景色')
+    lines[index + 1] = ' ' + rgb.map((value) => String(value).padStart(3)).join(' ')
+  }
+  if (options.model !== undefined) {
+    const model = Math.round(Number(options.model))
+    if (!Number.isInteger(model) || model < 0 || model > 4) {
+      throw new Error('model 必须是 0–4 的整数（0=球棍、1=空间填充）')
+    }
+    const index = lines.findIndex((line) => /^MODEL\s/.test(line.trim()))
+    if (index < 0) throw new Error('场景里没有 MODEL 行，无法改显示模型')
+    const numbers = lines[index].trim().split(/\s+/).slice(1)
+    lines[index] = 'MODEL ' + [model, numbers[1] ?? '1', numbers[2] ?? '0'].map((value, order) => String(value).padStart(2)).join(' ')
+  }
+  return lines.join('\n')
+}
+
+/**
+ * 解析 VESTA 的 wyckoff.dat。
+ * 格式：群头（同 spgra.dat）→ 每个 Wyckoff 位置若干行：
+ *   第一行 `<multiplicity> <letter> <site symmetry>`，随后是坐标三元组 `(x,y,z)`，`(0,y,z)` …
+ * 坐标里的 x/y/z 是自由参数，(0,½,…) 是固定值。
+ * @param {string} text - wyckoff.dat 内容。
+ * @returns {Map<number, { symbol: string, sites: Array<{ multiplicity: number, letter: string, site: string, rows: number[][][] }> }>}
+ */
+export function parseWyckoffTable(text) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  const groups = new Map()
+  let current = null
+  let site = null
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (!line) continue
+    const header = /^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.+?)$/.exec(line)
+    if (header && !/^\(/.test(line)) {
+      const number = Number(header[1])
+      if (!groups.has(number)) {
+        current = { symbol: header[6].replace(/\s+/g, ' ').trim(), sites: [] }
+        groups.set(number, current)
+      } else {
+        current = null      // 同号多设置：只保留第一块（与 spgra 的处理保持一致）
+      }
+      site = null
+      continue
+    }
+    if (!current) continue
+    const siteHeader = /^(\d+)\s+([a-zA-Z])\s+(\S*)$/.exec(line)
+    if (siteHeader) {
+      site = {
+        multiplicity: Number(siteHeader[1]),
+        letter: siteHeader[2],
+        site: siteHeader[3] ?? '',
+        rows: [],
+      }
+      current.sites.push(site)
+      continue
+    }
+    if (/^\(/.test(line) && site) {
+      const triples = line.split(/\s+/).filter((token) => /^\(.*\)$/.test(token))
+      for (const token of triples) {
+        const expression = token.replace(/^\(|\)$/g, '')
+        try {
+          site.rows.push(symmetryOperationToMatrix(expression.replace(/\s+/g, '')))
+        } catch {
+          /* 解析不了的项跳过 */
+        }
+      }
+    }
+  }
+  return groups
+}
+
+/** 解 3×(3+1) 线性方程组（高斯消元，失败返回 null）。 */
+function solve3(matrix) {
+  const rows = matrix.map((row) => row.slice())
+  for (let column = 0; column < 3; column += 1) {
+    let pivot = column
+    for (let row = column + 1; row < rows.length; row += 1) {
+      if (Math.abs(rows[row][column]) > Math.abs(rows[pivot][column])) pivot = row
+    }
+    if (Math.abs(rows[pivot][column]) < 1e-9) continue
+    const swap = rows[column]
+    rows[column] = rows[pivot]
+    rows[pivot] = swap
+    const factor = rows[column][column]
+    for (let index = column; index < 4; index += 1) rows[column][index] /= factor
+    for (let row = 0; row < rows.length; row += 1) {
+      if (row === column) continue
+      const scale = rows[row][column]
+      if (Math.abs(scale) < 1e-12) continue
+      for (let index = column; index < 4; index += 1) rows[row][index] -= scale * rows[column][index]
+    }
+  }
+  const solution = [0, 1, 2].map((index) => rows[index]?.[3] ?? 0)
+  return solution.every((value) => Number.isFinite(value)) ? solution : null
+}
+
+/**
+ * 给原子指派 Wyckoff 字母。
+ * 做法：对每个候选位置，用它的坐标表达式建立关于自由参数的方程；能解出参数、且所有表达式都命中，
+ * 同时该位置的多重度与原子轨道大小一致，就判为该位置。
+ * @param {object} structure - 结构。
+ * @param {number} number - 空间群编号。
+ * @param {Map} wyckoffTable - `parseWyckoffTable` 的结果。
+ * @param {Map} spaceGroupTable - `parseSpaceGroupTable` 的结果（用来算轨道大小）。
+ * @param {number} [tolerance] - 坐标容差。
+ * @returns {Array<{ atomIndex:number, symbol:string, letter:string, multiplicity:number, site:string, ok:boolean }>}
+ */
+export function assignWyckoff(structure, number, wyckoffTable, spaceGroupTable, tolerance = 1e-3) {
+  const group = wyckoffTable instanceof Map ? wyckoffTable.get(Number(number)) : wyckoffTable?.[Number(number)]
+  if (!group) throw new Error('wyckoff 表里没有编号 ' + number)
+  void spaceGroupTable
+  // wyckoff.dat 的坐标列表只列「点群轨道」，不含面心/体心平移，所以生成位置时要乘上点阵平移
+  const centers = centeringTranslations(group.symbol)
+  const determinant3 = (row) => row[0][0] * (row[1][1] * row[2][2] - row[1][2] * row[2][1])
+    - row[0][1] * (row[1][0] * row[2][2] - row[1][2] * row[2][0])
+    + row[0][2] * (row[1][0] * row[2][1] - row[1][1] * row[2][0])
+  return structure.atoms.map((atom, atomIndex) => {
+    const candidates = []
+    for (const site of group.sites) {
+      if (site.rows.length === 0) continue
+      // 1) 找一个可逆的坐标表达式来解出自由参数；全是固定坐标时参数取 0
+      let variables = null
+      for (const row of site.rows) {
+        if (Math.abs(determinant3(row)) < 1e-9) continue
+        const solution = solve3([
+          [row[0][0], row[0][1], row[0][2], atom.frac[0] - row[0][3]],
+          [row[1][0], row[1][1], row[1][2], atom.frac[1] - row[1][3]],
+          [row[2][0], row[2][1], row[2][2], atom.frac[2] - row[2][3]],
+        ])
+        if (solution) { variables = solution; break }
+      }
+      if (!variables) variables = [0, 0, 0]
+      // 2) 用解出的参数生成整个轨道（含点阵平移）
+      let hit = false
+      for (const row of site.rows) {
+        for (const shift of centers) {
+          let matched = true
+          for (let axis = 0; axis < 3 && matched; axis += 1) {
+            let predicted = row[axis][0] * variables[0] + row[axis][1] * variables[1]
+              + row[axis][2] * variables[2] + row[axis][3] + shift[axis]
+            predicted -= Math.floor(predicted)
+            let actual = atom.frac[axis] - Math.floor(atom.frac[axis])
+            let delta = Math.abs(predicted - actual)
+            delta = Math.min(delta, Math.abs(delta - 1))
+            if (delta > tolerance) matched = false
+          }
+          if (matched) { hit = true; break }
+        }
+        if (hit) break
+      }
+      if (hit) candidates.push(site)
+    }
+    if (candidates.length > 0) {
+      // 3) 多个位置可能同时包含该点（一般位置包含所有点）：取多重度最小=对称性最高的那个
+      candidates.sort((a, b) => a.multiplicity - b.multiplicity)
+      const best = candidates[0]
+      return { atomIndex, symbol: atom.symbol, letter: best.letter, multiplicity: best.multiplicity, site: best.site, ok: true }
+    }
+    return { atomIndex, symbol: atom.symbol, letter: '?', multiplicity: 0, site: '', ok: false }
+  })
+}
+
+/**
+ * 读并缓存 VESTA 的 wyckoff.dat（Wyckoff 位置表）。
+ * @param {string} tablePath - wyckoff.dat 路径（VESTA 安装目录下）。
+ * @returns {Map<number, object>} 群号 → { symbol, sites }。
+ */
+let wyckoffTableCache = null
+let wyckoffTableCachePath = ''
+
+export function loadWyckoffTable(tablePath) {
+  const path = toAbsolute(String(tablePath), process.cwd())
+  if (!existsSync(path)) throw new Error('找不到 Wyckoff 表：' + path + '（通常位于 VESTA 安装目录）')
+  if (wyckoffTableCache && wyckoffTableCachePath === path) return wyckoffTableCache
+  wyckoffTableCache = parseWyckoffTable(readFileSync(path, 'utf8'))
+  wyckoffTableCachePath = path
+  return wyckoffTableCache
+}
+
+/**
+ * 解析 CIF（晶体学信息文件）。
+ *
+ * 只做「够用」的子集：标量标签（晶胞参数/空间群/化学式）、`loop_` 表格
+ * （`_space_group_symop_operation_xyz` 与 `_atom_site_*`）。CIF 值里的引号、分号块、
+ * 以及 `?`/`.`（缺失值）都按规范处理。
+ * @param {string} text - CIF 内容。
+ * @returns {{ data: string|null, tags: Record<string,string>, loops: Array<{ headers: string[], rows: string[][] }>, cell: object|null, spaceGroup: string|null, atoms: Array<object>, ops: string[] }}
+ */
+export function parseCif(text) {
+  const source = String(text ?? '').replace(/\r\n/g, '\n')
+  const lines = source.split('\n')
+  const tags = {}
+  const loops = []
+  let data = null
+  let index = 0
+
+  const stripComment = (line) => {
+    // CIF 的注释以 # 开头；值里可能出现 '#'，这里只在引号外剥离
+    let inQuote = false
+    let quote = ''
+    for (let position = 0; position < line.length; position += 1) {
+      const char = line[position]
+      if (inQuote) {
+        if (char === quote) inQuote = false
+        continue
+      }
+      if (char === '"' || char === "'") { inQuote = true; quote = char; continue }
+      if (char === '#') return line.slice(0, position)
+    }
+    return line
+  }
+  const tokensOf = (line) => {
+    const tokens = []
+    let token = ''
+    let inQuote = false
+    let quote = ''
+    for (const char of line.trim()) {
+      if (inQuote) {
+        if (char === quote) inQuote = false
+        else token += char
+        continue
+      }
+      if (char === '"' || char === "'") { inQuote = true; quote = char; continue }
+      if (/\s/.test(char)) {
+        if (token !== '') { tokens.push(token); token = '' }
+        continue
+      }
+      token += char
+    }
+    if (token !== '') tokens.push(token)
+    return tokens
+  }
+
+  while (index < lines.length) {
+    const raw = lines[index]
+    const line = stripComment(raw).trim()
+    index += 1
+    if (line === '') continue
+    if (/^data_/i.test(line)) { data = line.slice(5).trim(); continue }
+    if (/^loop_$/i.test(line)) {
+      const headers = []
+      while (index < lines.length) {
+        const next = stripComment(lines[index]).trim()
+        if (next.startsWith('_')) { headers.push(next.split(/\s+/)[0]); index += 1; continue }
+        break
+      }
+      const rows = []
+      while (index < lines.length) {
+        const next = stripComment(lines[index]).trim()
+        if (next === '' || next.startsWith('_') || /^loop_$/i.test(next) || /^data_/i.test(next)) break
+        rows.push(tokensOf(next))
+        index += 1
+      }
+      loops.push({ headers, rows })
+      continue
+    }
+    if (line.startsWith(';')) {
+      // 多行文本块：跳过到下一个以 ; 开头的行
+      while (index < lines.length && !lines[index].startsWith(';')) index += 1
+      index += 1
+      continue
+    }
+    if (line.startsWith('_')) {
+      const match = /^(_\S+)\s+(.*)$/.exec(line)
+      if (match) tags[match[1].toLowerCase()] = match[2].trim()
+    }
+  }
+
+  const number = (key) => {
+    const value = tags[key]
+    if (value === undefined) return null
+    const parsed = Number(String(value).replace(/\(.*\)$/, ''))
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  const cell = {
+    a: number('_cell_length_a'), b: number('_cell_length_b'), c: number('_cell_length_c'),
+    alpha: number('_cell_angle_alpha'), beta: number('_cell_angle_beta'), gamma: number('_cell_angle_gamma'),
+  }
+  const spaceGroup = tags['_symmetry_space_group_name_h-m'] ?? tags['_space_group_name_h-m_alt'] ?? null
+  const itNumber = number('_space_group_it_number')
+
+  let ops = []
+  let atoms = []
+  for (const loop of loops) {
+    if (loop.headers.includes('_space_group_symop_operation_xyz')) {
+      const column = loop.headers.indexOf('_space_group_symop_operation_xyz')
+      ops = loop.rows.map((row) => row[column]).filter(Boolean)
+    }
+    if (loop.headers.includes('_atom_site_fract_x')) {
+      const column = (name) => loop.headers.indexOf(name)
+      const colLabel = column('_atom_site_label')
+      const colSymbol = column('_atom_site_type_symbol')
+      const colX = column('_atom_site_fract_x')
+      const colY = column('_atom_site_fract_y')
+      const colZ = column('_atom_site_fract_z')
+      const colOcc = column('_atom_site_occupancy')
+      // CIF 数值常带标准不确定度：'.55909(13)' / '1.05563(11)'；另外 '.5' 这种省略前导零也要支持
+      const cifNumber = (value) => {
+        if (value === undefined || value === null) return null
+        const cleaned = String(value).replace(/\(.*\)$/, '').trim()
+        if (cleaned === '' || cleaned === '.' || cleaned === '?') return null
+        const parsed = Number(cleaned)
+        return Number.isFinite(parsed) ? parsed : null
+      }
+      // 一个 CIF 可能把不同元素拆成多个 _atom_site 循环（例如 H 一份、重原子一份）：累加而不是覆盖
+      const parsedRows = loop.rows.map((row) => {
+        const label = colLabel >= 0 ? row[colLabel] : (colSymbol >= 0 ? row[colSymbol] : 'X')
+        const rawSymbol = colSymbol >= 0 ? row[colSymbol] : label
+        // 标签可能是 'Fe-oct'/'O1'/'C12A'：只取前导元素字母（含两字母元素）
+        const symbolMatch = /^([A-Za-z]{1,2})/.exec(String(rawSymbol).replace(/[^A-Za-z]/g, ''))
+        const symbol = symbolMatch
+          ? symbolMatch[1].charAt(0).toUpperCase() + symbolMatch[1].slice(1).toLowerCase()
+          : 'X'
+        return {
+          label,
+          symbol: symbol === '' ? 'X' : symbol,
+          frac: [cifNumber(row[colX]), cifNumber(row[colY]), cifNumber(row[colZ])],
+          occupancy: colOcc >= 0 ? cifNumber(row[colOcc]) : null,
+        }
+      }).filter((atom) => atom.frac.every((value) => value !== null))
+      atoms = atoms.concat(parsedRows)
+    }
+  }
+
+  return { data, tags, loops, cell, spaceGroup, itNumber, atoms, ops }
+}
+
+/**
+ * CIF → 结构（`{a1,a2,a3,atoms}`）。
+ *
+ * 默认用 CIF 自带的对称操作展开（CIF 的操作列表已含点阵平移，不需要再补 centering），
+ * 展开后每个原子带 `occupancy`；也可以只要不对称单元（`expandSymmetry: false`）。
+ * @param {string} text - CIF 内容。
+ * @param {{ expandSymmetry?: boolean }} [options] - 是否展开对称操作，默认 true。
+ * @returns {{ a1: number[], a2: number[], a3: number[], atoms: Array<{symbol:string, frac:number[], occupancy:number|null}>, spaceGroup: string|null, siteCount: number }}
+ */
+export function structureFromCif(text, options = {}) {
+  const parsed = parseCif(text)
+  const { a, b, c, alpha, beta, gamma } = parsed.cell ?? {}
+  if (![a, b, c, alpha, beta, gamma].every((value) => Number.isFinite(value))) {
+    throw new Error('CIF 缺少完整的晶胞参数（_cell_length_* / _cell_angle_*）')
+  }
+  if (parsed.atoms.length === 0) throw new Error('CIF 里没有 _atom_site 记录')
+  const [a1, a2, a3] = latticeFromCellParameters({ a, b, c, alpha, beta, gamma })
+  const base = { a1, a2, a3 }
+  const expand = options.expandSymmetry !== false
+  let operationStrings = parsed.ops
+  // CIF 里没有 _space_group_symop_operation_xyz 时，回退到 VESTA 的 spgra.dat
+  if (expand && operationStrings.length === 0 && options.spaceGroupTablePath) {
+    try {
+      const table = loadSpaceGroupTable(options.spaceGroupTablePath)
+      let group = Number.isFinite(parsed.itNumber) ? table.get(parsed.itNumber) : null
+      if (!group && parsed.spaceGroup) {
+        const normalize = (value) => String(value).replace(/[::]/g, ' ').replace(/\s+/g, '').toLowerCase()
+        const wanted = normalize(parsed.spaceGroup)
+        for (const entry of table.values()) {
+          if (normalize(entry.symbol) === wanted) { group = entry; break }
+        }
+      }
+      if (group) {
+        const centers = centeringTranslations(group.symbol)
+        const combined = []
+        for (const matrix of group.matrices) {
+          for (const shift of centers) {
+            combined.push([[matrix[0][0], matrix[0][1], matrix[0][2], matrix[0][3] + shift[0]],
+              [matrix[1][0], matrix[1][1], matrix[1][2], matrix[1][3] + shift[1]],
+              [matrix[2][0], matrix[2][1], matrix[2][2], matrix[2][3] + shift[2]]])
+          }
+        }
+        operationStrings = combined.map(() => '')
+        parsed.opsMatrices = combined
+      }
+    } catch {
+      /* 没有表就退回不展开 */
+    }
+  }
+  if (!expand || (operationStrings.length === 0 && !parsed.opsMatrices)) {
+    return {
+      ...base,
+      atoms: parsed.atoms.map((atom) => ({ symbol: atom.symbol, frac: atom.frac, occupancy: atom.occupancy })),
+      spaceGroup: parsed.spaceGroup,
+      siteCount: parsed.atoms.length,
+    }
+  }
+  const matrices = parsed.opsMatrices ?? parsed.ops.map((op) => symmetryOperationToMatrix(op))
+  const atoms = []
+  const seen = new Set()
+  for (const atom of parsed.atoms) {
+    for (const matrix of matrices) {
+      const frac = [0, 1, 2].map((row) => {
+        const line = matrix[row]
+        let value = line[0] * atom.frac[0] + line[1] * atom.frac[1] + line[2] * atom.frac[2] + line[3]
+        value -= Math.floor(value)
+        if (value < 1e-4 || value > 1 - 1e-4) value = 0
+        return value
+      })
+      const key = atom.symbol + ':' + frac.map((value) => Math.round(value * 1e4)).join(',')
+      if (seen.has(key)) continue
+      seen.add(key)
+      atoms.push({ symbol: atom.symbol, frac, occupancy: atom.occupancy })
+    }
+  }
+  return { ...base, atoms, spaceGroup: parsed.spaceGroup, siteCount: parsed.atoms.length }
+}
+
+/**
+ * 反演一个 3×4 对称操作矩阵：把 `y = M·x + t` 变成 `x = M⁻¹·(y − t)`。
+ * @param {number[][]} matrix - 3×4 增广矩阵。
+ * @returns {number[][]} 逆操作的 3×4 矩阵。
+ */
+export function invertOperation(matrix) {
+  const m = [[matrix[0][0], matrix[0][1], matrix[0][2]],
+    [matrix[1][0], matrix[1][1], matrix[1][2]],
+    [matrix[2][0], matrix[2][1], matrix[2][2]]]
+  const det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+    - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+    + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+  if (Math.abs(det) < 1e-12) throw new Error('对称操作矩阵不可逆')
+  const inv = [
+    [(m[1][1] * m[2][2] - m[1][2] * m[2][1]) / det, (m[0][2] * m[2][1] - m[0][1] * m[2][2]) / det, (m[0][1] * m[1][2] - m[0][2] * m[1][1]) / det],
+    [(m[1][2] * m[2][0] - m[1][0] * m[2][2]) / det, (m[0][0] * m[2][2] - m[0][2] * m[2][0]) / det, (m[0][2] * m[1][0] - m[0][0] * m[1][2]) / det],
+    [(m[1][0] * m[2][1] - m[1][1] * m[2][0]) / det, (m[0][1] * m[2][0] - m[0][0] * m[2][1]) / det, (m[0][0] * m[1][1] - m[0][1] * m[1][0]) / det],
+  ]
+  const t = [0, 1, 2].map((row) => -(inv[row][0] * matrix[0][3] + inv[row][1] * matrix[1][3] + inv[row][2] * matrix[2][3]))
+  return [[...inv[0], t[0]], [...inv[1], t[1]], [...inv[2], t[2]]]
+}
+
+/**
+ * 对称化：把「近似」满足某空间群的结构投射到严格的对称位置上。
+ *
+ * 做法（迭代投影）：对每个原子、每条对称操作 g，用当前结构去找 g(x) 最近的原子；
+ * 若距离在容差内，就把那个原子用 g⁻¹ 拉回当前原子的参考系里累加，最后取平均。
+ * 反复几轮后，偏差被平均掉，结构落到群的不动子空间上。
+ * @param {object} structure - `{a1,a2,a3,atoms}`。
+ * @param {number} number - 空间群编号。
+ * @param {Map} table - `parseSpaceGroupTable` 的结果。
+ * @param {{ tolerance?: number, iterations?: number }} [options] - 匹配容差（分数坐标）与迭代轮数。
+ * @returns {{ structure: object, maxShift: number, iterations: number, matched: number }}
+ */
+export function symmetrizeStructure(structure, number, table, options = {}) {
+  const group = table instanceof Map ? table.get(Number(number)) : table?.[Number(number)]
+  if (!group) throw new Error('空间群表里没有编号 ' + number)
+  const tolerance = Number(options.tolerance ?? 0.02)
+  const iterations = Math.max(1, Math.min(10, Math.round(Number(options.iterations ?? 3))))
+  const centers = centeringTranslations(group.symbol)
+  const operations = []
+  for (const matrix of group.matrices) {
+    for (const shift of centers) {
+      operations.push([
+        [matrix[0][0], matrix[0][1], matrix[0][2], matrix[0][3] + shift[0]],
+        [matrix[1][0], matrix[1][1], matrix[1][2], matrix[1][3] + shift[1]],
+        [matrix[2][0], matrix[2][1], matrix[2][2], matrix[2][3] + shift[2]],
+      ])
+    }
+  }
+  const inverses = operations.map((operation) => invertOperation(operation))
+
+  const apply = (operation, frac) => [0, 1, 2].map((row) => {
+    const line = operation[row]
+    const value = line[0] * frac[0] + line[1] * frac[1] + line[2] * frac[2] + line[3]
+    return value - Math.floor(value)
+  })
+  const delta = (a, b) => {
+    const shifted = [0, 1, 2].map((axis) => {
+      let d = a[axis] - b[axis]
+      d -= Math.round(d)
+      return d
+    })
+    return Math.hypot(...shifted)
+  }
+
+  let atoms = structure.atoms.map((atom) => ({ ...atom, frac: atom.frac.slice() }))
+  let maxShift = 0
+  let matched = 0
+  for (let round = 0; round < iterations; round += 1) {
+    const next = atoms.map((atom) => {
+      const accumulator = [0, 0, 0]
+      let weight = 0
+      for (let index = 0; index < operations.length; index += 1) {
+        const image = apply(operations[index], atom.frac)
+        let best = null
+        for (let other = 0; other < atoms.length; other += 1) {
+          if (atoms[other].symbol !== atom.symbol) continue
+          const distance = delta(atoms[other].frac, image)
+          if (best === null || distance < best.distance) best = { distance, other }
+        }
+        if (!best || best.distance > tolerance) continue
+        matched += 1
+        // 把命中的原子用 g⁻¹ 拉回参考系
+        const pulled = apply(inverses[index], atoms[best.other].frac)
+        // 处理周期边界：以当前原子为基准选择最近的像
+        for (let axis = 0; axis < 3; axis += 1) {
+          let value = pulled[axis]
+          while (value - atom.frac[axis] > 0.5) value -= 1
+          while (value - atom.frac[axis] < -0.5) value += 1
+          accumulator[axis] += value
+        }
+        weight += 1
+      }
+      if (weight === 0) return { ...atom, frac: atom.frac.slice() }
+      const averaged = [0, 1, 2].map((axis) => accumulator[axis] / weight)
+      const wrapped = averaged.map((value) => {
+        let v = value - Math.floor(value)
+        if (v < 1e-9 || v > 1 - 1e-9) v = 0
+        return v
+      })
+      const shift = Math.hypot(...[0, 1, 2].map((axis) => wrapped[axis] - atom.frac[axis]))
+      maxShift = Math.max(maxShift, shift)
+      return { ...atom, frac: wrapped }
+    })
+    atoms = next
+  }
+  return {
+    structure: { ...structure, atoms },
+    maxShift,
+    iterations,
+    matched,
+  }
+}
+
+/**
+ * 解析 VESTA 的 elements.ini（元素半径与配色）。
+ *
+ * 每行 8 列：`<Z> <符号> <半径> <半径2> <半径3> <R> <G> <B>`，颜色是 0–1 的浮点数。
+ * VESTA 的原子配色与半径**来自这个全局文件**，不是场景文件（`.vesta` 里的 ATOMT 会被忽略）。
+ * @param {string} text - elements.ini 内容。
+ * @returns {Map<string, { z:number, symbol:string, radius:number, radii:number[], rgb:number[], color:string }>}
+ */
+export function parseElementsIni(text) {
+  const elements = new Map()
+  for (const raw of String(text ?? '').split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#') || /^[A-Za-z]/.test(line)) continue
+    const parts = line.split(/\s+/)
+    if (parts.length < 8) continue
+    const z = Number(parts[0])
+    const symbol = parts[1]
+    const radii = parts.slice(2, 5).map(Number)
+    const rgbFloat = parts.slice(5, 8).map(Number)
+    if (!Number.isFinite(z) || !symbol || radii.some((v) => !Number.isFinite(v)) || rgbFloat.some((v) => !Number.isFinite(v))) continue
+    const rgb = rgbFloat.map((value) => Math.max(0, Math.min(255, Math.round(value * 255))))
+    elements.set(symbol, {
+      z,
+      symbol,
+      radius: radii[0],
+      radii,
+      rgb,
+      color: '#' + rgb.map((value) => value.toString(16).padStart(2, '0')).join(''),
+    })
+  }
+  return elements
+}
+
+/**
+ * 改写 elements.ini 里指定元素的颜色与半径，其余行原样保留。
+ * @param {string} text - 原始内容。
+ * @param {Record<string, { color?: number[], radius?: number }>} changes - 元素符号 → 要改的字段（color 为 0–255）。
+ * @returns {{ text: string, changed: string[] }} 新内容与改动过的元素。
+ */
+export function editElementsIni(text, changes = {}) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  const changed = []
+  const wanted = new Map(Object.entries(changes))
+  for (let index = 0; index < lines.length; index += 1) {
+    const parts = lines[index].trim().split(/\s+/)
+    if (parts.length < 8) continue
+    const symbol = parts[1]
+    if (!wanted.has(symbol)) continue
+    const change = wanted.get(symbol)
+    const radii = parts.slice(2, 5).map(Number)
+    if (change.radius !== undefined) {
+      const radius = Number(change.radius)
+      if (!(radius > 0 && radius < 10)) throw new Error('半径必须在 0–10 Å 之间：' + change.radius)
+      radii[0] = radius
+    }
+    let rgbFloat = parts.slice(5, 8).map(Number)
+    if (change.color !== undefined) {
+      const rgb = Array.isArray(change.color) ? change.color.map(Number) : null
+      if (!rgb || rgb.length !== 3 || rgb.some((value) => !(value >= 0 && value <= 255))) {
+        throw new Error('颜色必须是三个 0–255 的整数：' + JSON.stringify(change.color))
+      }
+      rgbFloat = rgb.map((value) => Number((value / 255).toFixed(5)))
+    }
+    const indent = lines[index].match(/^\s*/)[0]
+    const symbolCell = symbol.padStart(3)
+    lines[index] = indent + [String(parts[0]).padStart(3), symbolCell, ...radii.map((v) => v.toFixed(2))]
+      .join(' ') + '    ' + rgbFloat.map((v) => v.toFixed(5)).join('    ')
+    changed.push(symbol)
+    wanted.delete(symbol)
+  }
+  return { text: lines.join('\n'), changed }
+}
+
+/**
+ * 体积数据的分位数：给一个 0–100 的百分比，返回对应的数值（线性插值）。
+ * 用于把「等值面画在 0.05 e/Å³」这类精确阈值换算成渲染器要的百分比。
+ * @param {object} volume - `readVolumeFile` 的结果。
+ * @param {number} percent - 0–100。
+ * @returns {number} 该百分比处的数值。
+ */
+export function volumeValueAtPercent(volume, percent) {
+  const values = volume.values
+  if (!values || values.length === 0) throw new Error('体积数据为空')
+  const clamped = Math.max(0, Math.min(100, Number(percent)))
+  const sorted = Float64Array.from(values).sort()
+  const position = (clamped / 100) * (sorted.length - 1)
+  const low = Math.floor(position)
+  const high = Math.min(sorted.length - 1, low + 1)
+  const weight = position - low
+  return sorted[low] * (1 - weight) + sorted[high] * weight
+}
+
+/**
+ * 反查：给一个数值，返回它在数据分布中的百分比（0–100）。
+ * @param {object} volume - 体积数据。
+ * @param {number} value - 目标数值（与体积数据同单位）。
+ * @returns {number} 0–100 的百分比。
+ */
+export function volumePercentForValue(volume, value) {
+  const values = volume.values
+  if (!values || values.length === 0) throw new Error('体积数据为空')
+  const target = Number(value)
+  if (!Number.isFinite(target)) throw new Error('目标值必须是有限数')
+  const sorted = Float64Array.from(values).sort()
+  // 二分找第一个 >= target 的位置
+  let low = 0
+  let high = sorted.length - 1
+  if (target <= sorted[0]) return 0
+  if (target >= sorted[high]) return 100
+  while (low < high) {
+    const middle = (low + high) >> 1
+    if (sorted[middle] < target) low = middle + 1
+    else high = middle
+  }
+  const above = low
+  const previous = Math.max(0, above - 1)
+  const span = sorted[above] - sorted[previous]
+  const fraction = span > 1e-12 ? (target - sorted[previous]) / span : 0
+  const position = previous + fraction
+  return (position / (sorted.length - 1)) * 100
+}
+
+/**
+ * 统计阈值以上的格点比例，回答「这个等值面大概包住多少体积」。
+ * @param {object} volume - 体积数据。
+ * @param {number} level - 阈值（同单位）。
+ * @returns {{ fraction: number, count: number, total: number }}
+ */
+export function volumeAboveLevel(volume, level) {
+  const values = volume.values
+  let count = 0
+  for (let index = 0; index < values.length; index += 1) if (values[index] >= level) count += 1
+  return { fraction: count / Math.max(1, values.length), count, total: values.length }
+}
+
+/**
+ * 读取 `.vesta` 的显示边界（BOUND 段：三个方向的起止晶胞）。
+ * @param {string} text - .vesta 内容。
+ * @returns {{ ranges: number[][]|null }} 每个方向一对 [起, 止]；没有 BOUND 段时 ranges 为 null。
+ */
+export function readSceneBoundary(text) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  const index = lines.findIndex((line) => line.trim() === 'BOUND')
+  if (index < 0) return { ranges: null }
+  const numbers = (lines[index + 1] ?? '').trim().split(/\s+/).map(Number).filter((value) => Number.isFinite(value))
+  if (numbers.length < 6) return { ranges: null }
+  return { ranges: [[numbers[0], numbers[1]], [numbers[2], numbers[3]], [numbers[4], numbers[5]]] }
+}
+
+/**
+ * 改写 `.vesta` 的显示边界（BOUND 段）。
+ *
+ * 实测：只改这 6 个数就能改变渲染结果（三组取值三次不同输出）；
+ * 范围变大时 VESTA 会把视图缩小以装下更多晶胞，所以「非白像素数」不能用来数原子。
+ * @param {string} text - .vesta 内容。
+ * @param {number[][]} ranges - 三个方向各一对 [起, 止]（整数，-9..9）。
+ * @returns {string} 修改后的文本。
+ */
+export function applySceneBoundary(text, ranges) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  const index = lines.findIndex((line) => line.trim() === 'BOUND')
+  if (index < 0) throw new Error('场景里没有 BOUND 段，无法改显示边界')
+  if (!Array.isArray(ranges) || ranges.length !== 3) throw new Error('ranges 必须是三个方向各一对 [起, 止]')
+  const flat = ranges.map((pair) => {
+    if (!Array.isArray(pair) || pair.length !== 2) throw new Error('每个方向必须是 [起, 止] 两个数')
+    const [start, end] = pair.map((value) => Math.round(Number(value)))
+    if (!Number.isInteger(start) || !Number.isInteger(end)) throw new Error('边界必须是整数')
+    if (start < -9 || end > 9) throw new Error('边界范围限制在 -9..9')
+    if (end <= start) throw new Error('止必须大于起：' + JSON.stringify(pair))
+    return [start, end]
+  })
+  lines[index + 1] = flat.flat().map((value) => String(value)).join(' ') + ' '
+  return lines.join('\n')
+}
+
+/**
+ * 晶胞的对称化（度规张量投影）。
+ *
+ * 晶格必须满足对称约束：对每条操作的旋转部分 R，度规张量 G = A·Aᵀ 都要满足 G = Rᵀ G R。
+ * 把所有操作下的 Rᵀ G R 取平均，就是把 G **最小二乘投影**到「对称不变子空间」上。
+ * 这一步只改晶胞、不动原子分数坐标（分数坐标在换基下不变）。
+ * @param {object} structure - `{a1,a2,a3,atoms}`。
+ * @param {number} number - 空间群编号。
+ * @param {Map} table - `parseSpaceGroupTable` 的结果。
+ * @returns {{ structure: object, before: object, after: object, deviation: number }}
+ */
+export function symmetrizeCell(structure, number, table) {
+  const group = table instanceof Map ? table.get(Number(number)) : table?.[Number(number)]
+  if (!group) throw new Error('空间群表里没有编号 ' + number)
+  const A = [structure.a1, structure.a2, structure.a3]
+  const metric = [0, 1, 2].map((row) => [0, 1, 2].map((column) =>
+    A[row][0] * A[column][0] + A[row][1] * A[column][1] + A[row][2] * A[column][2]))
+  const projected = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+  let count = 0
+  // 只需要点群操作的旋转部分；点阵平移不影响度规
+  for (const matrix of group.matrices) {
+    const R = [[matrix[0][0], matrix[0][1], matrix[0][2]],
+      [matrix[1][0], matrix[1][1], matrix[1][2]],
+      [matrix[2][0], matrix[2][1], matrix[2][2]]]
+    // 计算 Rᵀ·G·R：(G·R)[row][col] = Σ_k G[row][k]·R[k][col]
+    const GR = [0, 1, 2].map((row) => [0, 1, 2].map((column) =>
+      metric[row][0] * R[0][column] + metric[row][1] * R[1][column] + metric[row][2] * R[2][column]))
+    const RGR = [0, 1, 2].map((row) => [0, 1, 2].map((column) =>
+      R[0][row] * GR[0][column] + R[1][row] * GR[1][column] + R[2][row] * GR[2][column]))
+    for (let row = 0; row < 3; row += 1) {
+      for (let column = 0; column < 3; column += 1) projected[row][column] += RGR[row][column]
+    }
+    count += 1
+  }
+  for (let row = 0; row < 3; row += 1) {
+    for (let column = 0; column < 3; column += 1) projected[row][column] /= Math.max(1, count)
+  }
+  // 对称化（理论上已是，数值上再抹平一次）
+  for (let row = 0; row < 3; row += 1) {
+    for (let column = row + 1; column < 3; column += 1) {
+      const mean = (projected[row][column] + projected[column][row]) / 2
+      projected[row][column] = mean
+      projected[column][row] = mean
+    }
+  }
+  // 由度规张量还原晶格矢量（Cholesky）
+  const [g00, g01, g02] = [projected[0][0], projected[0][1], projected[0][2]]
+  const g11 = projected[1][1]
+  const g12 = projected[1][2]
+  const g22 = projected[2][2]
+  const a1x = Math.sqrt(Math.max(g00, 1e-12))
+  const a2x = g01 / a1x
+  const a2y = Math.sqrt(Math.max(g11 - a2x * a2x, 1e-12))
+  const a3x = g02 / a1x
+  const a3y = (g12 - a2x * a3x) / Math.max(a2y, 1e-12)
+  const a3z = Math.sqrt(Math.max(g22 - a3x * a3x - a3y * a3y, 1e-12))
+  const a1 = [a1x, 0, 0]
+  const a2 = [a2x, a2y, 0]
+  const a3 = [a3x, a3y, a3z]
+  const before = cellParameters([structure.a1, structure.a2, structure.a3])
+  const after = cellParameters([a1, a2, a3])
+  // 偏差：原始度规与投影后度规的最大相对差
+  // 偏差用「平均对角元」做尺度，避免对角为 0 时除爆
+  const scale = Math.max(1e-9, (projected[0][0] + projected[1][1] + projected[2][2]) / 3)
+  let deviation = 0
+  for (let row = 0; row < 3; row += 1) {
+    for (let column = 0; column < 3; column += 1) {
+      deviation = Math.max(deviation, Math.abs(metric[row][column] - projected[row][column]) / scale)
+    }
+  }
+  return {
+    structure: { ...structure, a1, a2, a3 },
+    before: { a: before.a, b: before.b, c: before.c, alpha: before.alpha, beta: before.beta, gamma: before.gamma },
+    after: { a: after.a, b: after.b, c: after.c, alpha: after.alpha, beta: after.beta, gamma: after.gamma },
+    deviation,
   }
 }

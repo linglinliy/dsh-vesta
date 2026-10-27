@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-vesta",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "private": false,
   "description": "在对话里驱动本机 VESTA，并做 VASP 后处理（结构/体积/DOS/能带/电荷/功函数），提供 DSH 原生插件与 MCP 服务器两种前端",
   "license": "MIT",

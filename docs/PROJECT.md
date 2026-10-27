@@ -202,7 +202,7 @@ const TOOLS = PLUGIN_TOOLS.map((tool) => ({
 实测：
 
 ```
-tools/list → 20 个工具（与插件完全一致）
+tools/list → 28 个工具（与插件完全一致）
 tools/call check_structure → "结构预检：1 个结构，0 个有 error\n未发现问题"
 ```
 
@@ -215,7 +215,7 @@ tools/call check_structure → "结构预检：1 个结构，0 个有 error\n未
 
 - `serverInfo.version` 直接读 `package.json`：之前硬编码 `1.0.0`，而插件早已到 2.x，客户端看到的版本是错的；
 - `instructions` 之前还写着「只负责打开，不渲染、不导出图片」——在 MCP 只暴露 2 个工具时是对的，
-  现在 20 个工具都可用，描述已改为按类别列出能力。
+  现在 28 个工具都可用，描述已改为按类别列出能力。
 
 `test/mcp-parity.test.mjs` 增加一条：握手返回的版本必须等于 `package.json`，
 且 instructions 不能再出现过时措辞。

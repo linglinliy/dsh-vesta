@@ -12,7 +12,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { parsePoscar, buildSupercell, structureSummary, resolveTarget, readVolumeFile, encodeVolume, potcarElements, differenceVolume } from '../core.js'
+import { parsePoscar, structureFromCif, buildSupercell, structureSummary, resolveTarget, readVolumeFile, encodeVolume, potcarElements, differenceVolume } from '../core.js'
 import { buildPeriodicScene } from '../viewer/scene.js'
 import { installFriendlyErrors } from './_friendly-errors.mjs'
 
@@ -38,7 +38,10 @@ const cubeVolume = inputIsCube ? readVolumeFile(target) : null
 // VASP4 的 POSCAR 没有元素行：同目录 POTCAR 里的元素就是答案。
 const siblingPotcar = join(dirname(target), 'POTCAR')
 const siblingSymbols = existsSync(siblingPotcar) ? potcarElements(readFileSync(siblingPotcar, 'utf8')) : []
-const parsed = inputIsCube ? null : parsePoscar(readFileSync(target, 'utf8'), basename(target), { symbols: siblingSymbols })
+const inputIsCif = /\.cif$/i.test(target)
+const parsed = inputIsCube || inputIsCif ? null : parsePoscar(readFileSync(target, 'utf8'), basename(target), { symbols: siblingSymbols })
+// CIF 直接读：带占位率，查看器里部分占位按体积开三次方缩小
+const cifStructure = inputIsCif ? structureFromCif(readFileSync(target, 'utf8')) : null
 const structure = inputIsCube
   ? {
     a1: cubeVolume.steps[0].map((value) => value * cubeVolume.dims[0]),
@@ -46,7 +49,15 @@ const structure = inputIsCube
     a3: cubeVolume.steps[2].map((value) => value * cubeVolume.dims[2]),
     atoms: cubeVolume.atoms.map((atom) => ({ symbol: atom.symbol, cart: atom.cart })),
   }
-  : buildSupercell(parsed, repeat)
+  : inputIsCif
+    ? buildSupercell(
+      {
+        a1: cifStructure.a1, a2: cifStructure.a2, a3: cifStructure.a3,
+        atoms: cifStructure.atoms.map((atom) => ({ symbol: atom.symbol, frac: atom.frac, occupancy: atom.occupancy })),
+      },
+      repeat,
+    )
+    : buildSupercell(parsed, repeat)
 const summary = structureSummary(structure)
 const scene = buildPeriodicScene(structure)
 
@@ -127,7 +138,10 @@ const payload = {
   axesOrigin,
   atoms: scene.atoms.map((atom) => {
     const p = shift(atom.position)
-    return { x: p[0], y: p[1], z: p[2], sym: atom.symbol, color: atom.color, v: atom.radius, vdw: atom.vdw, ghost: atom.ghost === true }
+    return {
+      x: p[0], y: p[1], z: p[2], sym: atom.symbol, color: atom.color,
+      v: atom.radius, vdw: atom.vdw, ghost: atom.ghost === true, occupancy: atom.occupancy ?? 1,
+    }
   }),
   bonds: scene.bonds.map((bond) => ({ a: bond.a, b: bond.b })),
   cell: scene.cellEdges.map((edge) => [...shift(edge.from), ...shift(edge.to)]),

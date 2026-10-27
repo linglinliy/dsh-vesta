@@ -23,19 +23,26 @@ const loadTools = () => {
 
 const VESTA = DEFAULT_EXECUTABLE
 const hasVesta = existsSync(VESTA)
-const SI = '<本地任务根目录>/5.5/POSCAR'
+// 仓库里是脱敏占位路径；设了 VASP_FIXTURE_ROOT 就用真实数据
+const FIXTURE_ROOT = process.env.VASP_FIXTURE_ROOT ?? '<本地任务根目录>'
+const SI = `${FIXTURE_ROOT}/5.5/POSCAR`
 const hasFixture = existsSync(SI)
-const ADSORPTION = '<本地 pilot 数据集>/adsorption_tasks'
+const ADSORPTION = process.env.VASP_ADSORPTION_ROOT ?? '<本地 pilot 数据集>/adsorption_tasks'
 const hasAdsorption = existsSync(ADSORPTION)
 
-/** 结束时清掉 VESTA，避免单实例进程影响后续测试。 */
+/** 只清掉本用例自己打开的 VESTA（按 pid），不按镜像名全局杀，避免连累并行用例。 */
+let trackedPid = null
 const killVesta = () => {
+  if (!trackedPid) return
   try {
-    execFileSync('taskkill', ['/IM', 'VESTA.exe', '/F'], { stdio: 'ignore' })
+    execFileSync('taskkill', ['/PID', String(trackedPid), '/T', '/F'], { stdio: 'ignore' })
   } catch {
-    /* 没在跑就算了 */
+    /* 已经退出了 */
   }
+  trackedPid = null
 }
+/** 从 vesta_open 的摘要里记住 pid。 */
+const rememberPid = (summary) => { const match = /pid (\d+)/.exec(summary ?? ''); if (match) trackedPid = Number(match[1]) }
 
 test('vesta_info：报告可执行文件与版本标识', { skip: !hasVesta && '本机没有 VESTA' }, async () => {
   const tools = loadTools()
@@ -44,11 +51,12 @@ test('vesta_info：报告可执行文件与版本标识', { skip: !hasVesta && '
   assert.match(result.summary, /VESTA\.exe|3\.\d/)
 })
 
-test('vesta_open + vesta_menu + vesta_control：真实驱动 VESTA', { skip: (!hasVesta || !hasFixture) && '缺少 VESTA 或夹具' }, async () => {
+test('vesta_open + vesta_menu + vesta_control：真实驱动 VESTA', { skip: (!hasVesta || !hasFixture) && '缺少 VESTA 或夹具', timeout: 180000 }, async () => {
   const tools = loadTools()
   killVesta()
   try {
     const opened = await tools.get('vesta_open').execute({ paths: [SI] }, {})
+    rememberPid(opened.summary)
     assert.equal(opened.ok, true)
     assert.match(opened.summary, /POSCAR/)
     assert.ok(opened.summary.includes('pid') || /pid \d+/.test(opened.summary), `没拿到 pid：${opened.summary.slice(0, 120)}`)
@@ -65,6 +73,11 @@ test('vesta_open + vesta_menu + vesta_control：真实驱动 VESTA', { skip: (!h
     assert.ok(controlCount >= 20, `控件太少：${controlCount}`)
   } finally {
     killVesta()
+    // 常驻 PowerShell 宿主必须显式停掉，否则 node 进程会一直挂着（表现为测试“卡住”）
+    try {
+      const { stopUiHost } = await import('../core.js')
+      stopUiHost()
+    } catch { /* 没启动过就算了 */ }
   }
 })
 
