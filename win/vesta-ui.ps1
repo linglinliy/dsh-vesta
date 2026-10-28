@@ -90,6 +90,20 @@ public class VestaWin {
   [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
   [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+  [DllImport("user32.dll")] public static extern IntPtr GetWindowLongPtr(IntPtr h, int index);
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+  // WS_EX_TOPMOST = 0x8, GWL_EXSTYLE = -20
+  public static int PidOf(IntPtr h) { uint p; GetWindowThreadProcessId(h, out p); return (int)p; }
+  public static bool IsTopmost(IntPtr h) { try { return (GetWindowLongPtr(h, -20).ToInt64() & 0x8) != 0; } catch { return false; } }
+  // 返回 命中窗口|是否属于 root 子树|root
+  public static string HitTest(IntPtr root, int x, int y) {
+    var p = new POINT(); p.X = x; p.Y = y;
+    IntPtr hit = WindowFromPoint(p);
+    IntPtr r = GetAncestor(hit, 2);
+    return hit.ToInt64() + "|" + (r == root) + "|" + r.ToInt64();
+  }
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
 
   public static string Txt(IntPtr h) { var sb = new StringBuilder(512); GetWindowText(h, sb, 512); return sb.ToString(); }
@@ -271,11 +285,15 @@ public class VestaWin {
   }
 
   /// <summary>记录当前的光标屏幕坐标与前台窗口（用于操作后还原，减少对用户的干扰）。</summary>
-  public static string SaveEnv() {
+  public static string SaveEnv() { return SaveEnvFor(IntPtr.Zero); }
+  // 记录光标、前台以及（可选）指定窗口的置顶状态与句柄
+  public static string SaveEnvFor(IntPtr root) {
     POINT pt;
     GetCursorPos(out pt);
     IntPtr fg = GetForegroundWindow();
-    return pt.X + "," + pt.Y + "," + ((long)fg);
+    long rm = root.ToInt64();
+    bool top = root != IntPtr.Zero && IsTopmost(root);
+    return pt.X + "," + pt.Y + "," + ((long)fg) + "," + (top ? "1" : "0") + "," + rm;
   }
 
   /// <summary>还原光标位置与前台窗口。</summary>
@@ -286,6 +304,18 @@ public class VestaWin {
     if (!int.TryParse(parts[0], out x) || !int.TryParse(parts[1], out y) || !long.TryParse(parts[2], out hwnd)) return false;
     SetCursorPos(x, y);
     if (hwnd != 0) { SetForegroundWindow(new IntPtr(hwnd)); }
+    // 4/5 段：置顶状态与目标窗口（有则恢复原状态）
+    if (parts.Length >= 5) {
+      bool wasTop = parts[3] == "1";
+      long rootRaw;
+      if (long.TryParse(parts[4], out rootRaw) && rootRaw != 0) {
+        var root = new IntPtr(rootRaw);
+        if (IsTopmost(root) != wasTop) {
+          var flag = wasTop ? new IntPtr(-1) : new IntPtr(-2);
+          SetWindowPos(root, flag, 0, 0, 0, 0, 0x0013);
+        }
+      }
+    }
     return true;
   }
 
@@ -512,6 +542,54 @@ function Invoke-VestaRequest($req) {
       }
       return [pscustomobject]@{ ok = $true; vk = $vk }
     }
+    'topmost' {
+      # 临时置顶：鼠标按 z 序命中，不需要抢焦点；SWP_NOACTIVATE 防止激活
+      $top = [IntPtr][long]$req.hwnd
+      $root = [VestaWin]::GetAncestor($top, 2)
+      $prev = [VestaWin]::IsTopmost($root)
+      $flag = if ($req.on -eq $false) { -2 } else { -1 }   # HWND_NOTOPMOST / HWND_TOPMOST
+      [VestaWin]::SetWindowPos($root, [IntPtr]$flag, 0, 0, 0, 0, 0x0013) | Out-Null  # NOSIZE|NOMOVE|NOACTIVATE
+      $now = [VestaWin]::IsTopmost($root)
+      return [pscustomobject]@{ ok = $true; on = $now; previous = $prev; root = $root.ToInt64() }
+    }
+    'realdblclickat' {
+      # 真实双击：先恢复窗口并等布局稳定，再换算坐标，做命中校验，最后恢复置顶状态
+      $h = [IntPtr][long]$req.hwnd
+      $root = [VestaWin]::GetAncestor($h, 2)
+      $fgBefore = [VestaWin]::GetForegroundWindow()
+      $prevTop = [VestaWin]::IsTopmost($root)
+      [VestaWin]::ShowWindow($root, 9) | Out-Null
+      [VestaWin]::SetForegroundWindow($root) | Out-Null
+      if ($req.topmost) { [VestaWin]::SetWindowPos($root, [IntPtr](-1), 0, 0, 0, 0, 0x0013) | Out-Null }
+      Start-Sleep -Milliseconds 350
+      # 布局稳定后再换算，避免恢复窗口导致旧坐标失效
+      $pt = New-Object VestaWin+POINT
+      $pt.X = [int]$req.x
+      $pt.Y = [int]$req.y
+      if (-not [VestaWin]::ClientToScreen($h, [ref]$pt)) { return [pscustomobject]@{ ok = $false; error = "ClientToScreen failed" } }
+      $fgAfter = [VestaWin]::GetForegroundWindow()
+      $hit = [VestaWin]::HitTest($root, $pt.X, $pt.Y)
+      $hitParts = $hit.Split("|")
+      $hitInside = ($hitParts.Length -ge 2 -and $hitParts[1] -eq "True")
+      if (-not $hitInside) {
+        if ($prevTop -eq $false) { [VestaWin]::SetWindowPos($root, [IntPtr](-2), 0, 0, 0, 0, 0x0013) | Out-Null }
+        return [pscustomobject]@{ ok = $false; error = "point-not-in-target"; hit = $hit; screenX = $pt.X; screenY = $pt.Y; fgIsTarget = ($fgAfter -eq $root); topmostRestored = $true }
+      }
+      [VestaWin]::SetCursorPos($pt.X, $pt.Y) | Out-Null
+      Start-Sleep -Milliseconds 80
+      for ($i = 0; $i -lt 2; $i++) {
+        [VestaWin]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 25
+        [VestaWin]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)
+        if ($i -eq 0) { Start-Sleep -Milliseconds 60 }
+      }
+      # 恢复置顶到原状态（不能一律取消，用户原本可能就是置顶）
+      if ([VestaWin]::IsTopmost($root) -ne $prevTop) {
+        $flag = if ($prevTop) { -1 } else { -2 }
+        [VestaWin]::SetWindowPos($root, [IntPtr]$flag, 0, 0, 0, 0, 0x0013) | Out-Null
+      }
+      return [pscustomobject]@{ ok = $true; screenX = $pt.X; screenY = $pt.Y; hit = $hit; hitInside = $hitInside; fgBefore = $fgBefore.ToInt64(); fgAfter = $fgAfter.ToInt64(); fgIsTarget = ($fgAfter -eq $root); topmostPrevious = $prevTop; topmostNow = [VestaWin]::IsTopmost($root) }
+    }
     'realdrag' {
       # 真实鼠标拖拽（框选用）：按下 → 分步移动 → 抬起
       $h = [IntPtr][long]$req.hwnd
@@ -593,8 +671,19 @@ function Invoke-VestaRequest($req) {
       }
       return [pscustomobject]@{ ok = $true; rects = $rows }
     }
+    'wininfo' {
+      $h = [IntPtr][long]$req.hwnd
+      $pidv = [VestaWin]::PidOf($h)
+      $owner = [VestaWin]::GetWindow($h, 4)   # GW_OWNER
+      $title = New-Object System.Text.StringBuilder 256
+      [void][VestaWin]::GetWindowText($h, $title, 256)
+      $cls = New-Object System.Text.StringBuilder 128
+      [void][VestaWin]::GetClassName($h, $cls, 128)
+      return [pscustomobject]@{ ok = $true; hwnd = $h.ToInt64(); pid = $pidv; owner = $owner.ToInt64(); title = $title.ToString(); cls = $cls.ToString() }
+    }
     'saveenv' {
-      $state = [VestaWin]::SaveEnv()
+      $root = if ($req.hwnd) { [VestaWin]::GetAncestor([IntPtr][long]$req.hwnd, 2) } else { [IntPtr]::Zero }
+      $state = [VestaWin]::SaveEnvFor($root)
       return [pscustomobject]@{ ok = $true; state = $state }
     }
     'restoreenv' {

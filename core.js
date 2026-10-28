@@ -4920,7 +4920,7 @@ export async function findViewport(target) {
 // ── VESTA UI 常驻宿主 ──────────────────────────────────────────────────
 // 为什么：每次 spawn powershell 都要重新 Add-Type 编译一遍 Win32 声明（实测单次动作 ~14 s），
 // 直接操作的手感要求几十毫秒，所以起一个常驻进程，stdin 一行 JSON、stdout 一行 JSON。
-const HOST_ACTIONS = new Set(['windows', 'gl', 'drag', 'wheel', 'key', 'clickat', 'cmd', 'click', 'clickpost', 'settext', 'type', 'capture', 'clickcenter', 'realmouse', 'focusattach', 'chars', 'vk', 'foreground', 'chord', 'saveenv', 'restoreenv', 'keypost', 'realclickat', 'rect', 'realdrag', 'realkey', 'clientorigin'])
+const HOST_ACTIONS = new Set(['windows', 'gl', 'drag', 'wheel', 'key', 'clickat', 'cmd', 'click', 'clickpost', 'settext', 'type', 'capture', 'clickcenter', 'realmouse', 'focusattach', 'chars', 'vk', 'foreground', 'chord', 'saveenv', 'restoreenv', 'keypost', 'realclickat', 'rect', 'realdrag', 'realkey', 'clientorigin', 'realdblclickat', 'topmost', 'wininfo'])
 
 // 常驻宿主句柄放在 globalThis 上：插件为了热重载会用带 rev 查询串的 import 反复加载本模块，
 // 每次都是新的模块实例；句柄只存实例里的话，另一份实例的 stopUiHost() 停不掉子进程，
@@ -5616,31 +5616,53 @@ export async function deleteAtomInVesta(pid, options = {}) {
   const steps = []
   const findButton = (controls, pattern) => controls.find((item) => String(item.class) === 'Button' && pattern.test(String(item.text)))
 
-  await invokeCommand(117, target)
-  await pause(2500)
-  const dialog = await listControls('dialog')
-  steps.push('打开 Edit Data 对话框')
+  const structureRows = async () => {
+    const text = String(await readVestaText(Number(pid)).catch(() => '') ?? '')
+    const block = text.split(/={20,}/).filter((item) => item.includes('Structure parameters')).pop() ?? ''
+    return block.split(/\r?\n/).filter((line) => /^\s*\d+\s+[A-Z][a-z]?\s+\S+\s+-?\d/.test(line)).length
+  }
+  const rowsBefore = await structureRows()
+  steps.push('删除前结构原子行=' + rowsBefore)
 
-  const views = dialog.controls.filter((item) => /wxDataView/i.test(String(item.class)))
-  const pick = await pickVisibleAtomGrid(views.map((item) => item.hwnd))
-  if (!pick) throw new Error('找不到可见的原子列表控件')
-  steps.push('原子列表 hwnd=' + pick.hwnd + '（top=' + pick.top + '）')
+  // 打开（或复用）Edit Data，并校验它属于目标进程
+  let dialog = await listControls('dialog').catch(() => null)
+  if (!dialog?.window?.title || !/Edit Data/i.test(String(dialog.window.title))) {
+    await invokeCommand(117, target)
+    await pause(2500)
+    dialog = await listControls('dialog')
+  }
+  const info = await callUiHost({ action: 'wininfo', hwnd: dialog.window.hwnd }).catch((error) => ({ error: String(error?.message ?? error) }))
+  if (!info || info.error || !info.pid) {
+    throw new Error('无法确认 Edit Data 对话框归属：' + JSON.stringify(info).slice(0, 120))
+  }
+  if (Number(info.pid) !== Number(pid)) {
+    throw new Error('Edit Data 对话框不属于目标进程：' + info.pid + ' ≠ ' + pid)
+  }
+  steps.push('打开/复用 Edit Data（pid=' + info.pid + '，owner=' + info.owner + '）')
 
-  // 选中第 row 行：**纯投递点击**（不抢前台、不动光标）。
-  // 关键前提：必须挑 visible=true 的表——6 个 wxDataView 里 5 个是隐藏的，点隐藏表毫无反应。
-  await callUiHost({ action: 'clickat', hwnd: pick.hwnd, x: 40, y: 14 + row * 24 })
-  await pause(500)
-  steps.push('投递点击选中第 ' + (row + 1) + ' 行（纯消息，未抢前台）')
+  // 每次重试都重新枚举控件（句柄可能已重建）
+  let clicked = false
+  for (let attempt = 1; attempt <= 3 && !clicked; attempt += 1) {
+    const current = await listControls('dialog').catch(() => null)
+    if (!current?.controls) { await pause(500); continue }
+    const views = current.controls.filter((item) => /wxDataView/i.test(String(item.class)))
+    const pick = await pickVisibleAtomGrid(views.map((item) => item.hwnd))
+    if (!pick) { await pause(500); continue }
+    steps.push('第 ' + attempt + ' 次枚举：原子列表 hwnd=' + pick.hwnd + '（top=' + pick.top + '）')
+    await callUiHost({ action: 'clickat', hwnd: pick.hwnd, x: 40, y: 14 + row * 24 })
+    await pause(500)
+    const deletes = current.controls.filter((item) => String(item.class) === 'Button' && /^Delete$/i.test(String(item.text).trim()))
+    const rects = await controlRects(deletes.map((item) => item.hwnd))
+    const nearest = rects.sort((a, b) => Math.abs(a.top - pick.top) - Math.abs(b.top - pick.top))[0]
+    if (!nearest) { await pause(400); continue }
+    await callUiHost({ action: 'clickpost', hwnd: nearest.hwnd })
+    await pause(1200)
+    steps.push('点 Delete（hwnd=' + nearest.hwnd + '）')
+    clicked = true
+  }
+  if (!clicked) throw new Error('三次枚举都找不到可用的原子表/Delete 按钮')
 
-  const deletes = dialog.controls.filter((item) => String(item.class) === 'Button' && /^Delete$/i.test(String(item.text).trim()))
-  const rects = await controlRects(deletes.map((item) => item.hwnd))
-  const nearest = rects.sort((a, b) => Math.abs(a.top - pick.top) - Math.abs(b.top - pick.top))[0]
-  if (!nearest) throw new Error('找不到 Delete 按钮')
-  await callUiHost({ action: 'clickpost', hwnd: nearest.hwnd })
-  await pause(1200)
-  steps.push('点 Delete（hwnd=' + nearest.hwnd + '，投递）')
-
-  const apply = findButton(dialog.controls, /^&?Apply$/)
+  const apply = findButton((await listControls('dialog').catch(() => null))?.controls ?? [], /^&?Apply$/)
   if (apply) {
     await callUiHost({ action: 'clickpost', hwnd: apply.hwnd })
     await pause(1800)
@@ -5656,12 +5678,25 @@ export async function deleteAtomInVesta(pid, options = {}) {
     }
   }
 
-  return { ok: true, steps }
+  // 独立复验：结构行数必须减少，否则不算成功
+  await pause(600)
+  const rowsAfter = await structureRows()
+  steps.push('删除后结构原子行=' + rowsAfter)
+  if (!(rowsAfter === rowsBefore - 1)) {
+    return { ok: false, steps, rowsBefore, rowsAfter, reason: '结构行数未按预期减少' }
+  }
+  return { ok: true, steps, rowsBefore, rowsAfter }
 }
 
 /** 从一批 hwnd 里挑出「可见且够宽」的原子列表控件，并返回它的位置。 */
 async function pickVisibleAtomGrid(hwnds) {
-  const rects = await controlRects(hwnds)
+  // 宿主 rect 偶发返回空（竞态），重试几次再判定
+  let rects = []
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    rects = await controlRects(hwnds)
+    if (rects.some((item) => item.visible && item.width > 400)) break
+    await new Promise((resolve) => setTimeout(resolve, 400))
+  }
   const candidates = rects
     .filter((item) => item.visible && item.width > 400)
     .sort((a, b) => b.width * b.height - a.width * a.height)
@@ -5882,7 +5917,7 @@ export async function captureFullWindow(pid, out, options = {}) {
 
 export async function realKeyPress(hwnd, vk, options = {}) {
   const count = Number.isInteger(options.count) ? Math.max(1, options.count) : 1
-  const saved = await callUiHost({ action: 'saveenv' }).then((result) => result?.state ?? null).catch(() => null)
+  const saved = await callUiHost({ action: 'saveenv', hwnd: Number(hwnd) }).then((result) => result?.state ?? null).catch(() => null)
   try {
     const result = await callUiHost({ action: 'realkey', hwnd: Number(hwnd), key: Number(vk), count })
     return { ok: Boolean(result?.ok) }
@@ -5892,8 +5927,28 @@ export async function realKeyPress(hwnd, vk, options = {}) {
   }
 }
 
+/**
+ * 在控件内做一次**真实双击**（VESTA 手册称任意模式下双击可选中单个对象）。
+ * 与其它真实输入一样，保存/还原光标与前台窗口。
+ * @param {number} hwnd - 目标控件（画布）。
+ * @param {number} x - 客户区 x。
+ * @param {number} y - 客户区 y。
+ * @returns {Promise<{ ok: boolean, screenX?: number, screenY?: number }>} 结果。
+ */
+export async function realDoubleClickControlAt(hwnd, x, y, options = {}) {
+  const topmost = Boolean(options.topmost)
+  const saved = await callUiHost({ action: 'saveenv', hwnd: Number(hwnd) }).then((result) => result?.state ?? null).catch(() => null)
+  try {
+    const result = await callUiHost({ action: 'realdblclickat', hwnd: Number(hwnd), x: Math.round(x), y: Math.round(y), topmost })
+    return { ok: Boolean(result?.ok), error: result?.error, screenX: result?.screenX, screenY: result?.screenY, hit: result?.hit, hitInside: result?.hitInside, fgBefore: result?.fgBefore, fgAfter: result?.fgAfter, fgIsTarget: result?.fgIsTarget, topmostPrevious: result?.topmostPrevious, topmostNow: result?.topmostNow }
+  } finally {
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    if (saved) await callUiHost({ action: 'restoreenv', state: saved }).catch(() => null)
+  }
+}
+
 export async function realDragOnControl(hwnd, x1, y1, x2, y2) {
-  const saved = await callUiHost({ action: 'saveenv' }).then((result) => result?.state ?? null).catch(() => null)
+  const saved = await callUiHost({ action: 'saveenv', hwnd: Number(hwnd) }).then((result) => result?.state ?? null).catch(() => null)
   try {
     const result = await callUiHost({ action: 'realdrag', hwnd: Number(hwnd), x1: Math.round(x1), y1: Math.round(y1), x2: Math.round(x2), y2: Math.round(y2) })
     return { ok: Boolean(result?.ok) }
@@ -5905,7 +5960,7 @@ export async function realDragOnControl(hwnd, x1, y1, x2, y2) {
 
 export async function realClickControlAt(hwnd, x, y, options = {}) {
   const modifier = Number.isInteger(options.modifier) ? options.modifier : 0
-  const saved = await callUiHost({ action: 'saveenv' }).then((result) => result?.state ?? null).catch(() => null)
+  const saved = await callUiHost({ action: 'saveenv', hwnd: Number(hwnd) }).then((result) => result?.state ?? null).catch(() => null)
   try {
     const result = await callUiHost({ action: 'realclickat', hwnd: Number(hwnd), x: Math.round(Number(x)), y: Math.round(Number(y)), modifier })
     return { ok: Boolean(result?.ok), screenX: result?.screenX, screenY: result?.screenY, modifier }

@@ -26,7 +26,7 @@ const pluginTools = () => {
 /** 通过 stdio 向 MCP 服务器要一次 tools/list。 */
 const mcpTools = () => {
   const request = `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })}\n`
-  const result = spawnSync('node', ['mcp/server.js'], { input: request, encoding: 'utf8', cwd: ROOT })
+  const result = spawnSync(process.execPath, ['mcp/server.js'], { input: request, encoding: 'utf8', cwd: ROOT })
   const line = (result.stdout ?? '').trim().split(/\r?\n/)[0]
   assert.ok(line, `MCP 服务器没有输出；stderr：${(result.stderr ?? '').slice(0, 200)}`)
   return JSON.parse(line).result.tools
@@ -51,7 +51,7 @@ test('MCP 的 inputSchema 就是插件的 parameters', () => {
 
 test('MCP 的 serverInfo.version 与 package.json 一致，instructions 提到工具数', () => {
   const request = `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })}\n`
-  const result = spawnSync('node', ['mcp/server.js'], { input: request, encoding: 'utf8', cwd: ROOT })
+  const result = spawnSync(process.execPath, ['mcp/server.js'], { input: request, encoding: 'utf8', cwd: ROOT })
   const line = (result.stdout ?? '').trim().split(/\r?\n/)[0]
   const handshake = JSON.parse(line).result
   const manifest = JSON.parse(readFileSync(`${ROOT}/package.json`, 'utf8'))
