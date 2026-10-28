@@ -149,3 +149,11 @@ node scripts/selfcheck.mjs
 | E3 后台消息 | E2 成功后再替换后端 |
 | E4/E5 隐藏与恢复 | 同上 |
 | 身份解析 | 需要可读的选择反馈（P7 已排除状态栏路径） |
+
+## 6. 交付状态
+
+| 项 | 状态 |
+|---|---|
+| 代码与文档提交 | ✅ 本地提交 **90b0bd3**（16 个文件，+2517/-36） |
+| 推送到 GitHub | ❌ 阻塞：`github.com:443` 不可达（curl 返回 `000`），`api.github.com` 正常（`200`）；`git push` 报 `Failed to connect to github.com:443` |
+| 回归 | ✅ 单测 **28/28**，selfcheck **74/74** |
