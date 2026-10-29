@@ -10,6 +10,21 @@
 # Performs geometry measurement (E1) and selection trials (E2/E3) against a running VESTA,
 # writing one JSON object per trial. Pixel analysis is done here; structure checks are done in Node.
 
+# 进程 DPI 感知：必须在查询/截图前声明，否则拿到的是被虚拟化的逻辑像素（120 DPI 下差 1.25 倍）
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class DpiFix {
+  [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+  [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int value);
+  public static string Enable() {
+    try { if (SetProcessDpiAwarenessContext(new IntPtr(-4))) return "per-monitor-v2"; } catch { }
+    try { if (SetProcessDpiAwareness(2) == 0) return "per-monitor"; } catch { }
+    return "unaware";
+  }
+}
+'@ -ErrorAction SilentlyContinue
+[DpiFix]::Enable() | Out-Null
 Add-Type -AssemblyName System.Drawing
 Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
 using System;
@@ -41,6 +56,7 @@ public class VT {
   static bool Collect(IntPtr h, IntPtr p) { found.Add(h); return true; }
 
   public static string Post(IntPtr h, uint m, int w) { PostMessage(h, m, (IntPtr)w, IntPtr.Zero); return "ok"; }
+  public static IntPtr Fg() { return GetForegroundWindow(); }
   public static int ScreenW() { return GetSystemMetrics(0); }
   public static int ScreenH() { return GetSystemMetrics(1); }
 
@@ -198,7 +214,8 @@ $cl = 0; $ct = 0; $cw = 0; $chh = 0
 [void][VT]::Canvas($h, [ref]$cl, [ref]$ct, [ref]$cw, [ref]$chh)
 $pl = 0; $pt = 0; $pw = 0; $ph = 0
 [void][VT]::Palette($h, [ref]$pl, [ref]$pt, [ref]$pw, [ref]$ph)
-$pitch = if ($ph -gt 0) { [int]($ph / 8) } else { 0 }
+# 候选点击位置（来自截图目测，不代表按钮真实边界；语义未知）
+$candidateYs = @(126, 186, 236, 281, 326, 371, 416, 461)
 "canvas=$cl,$ct ${cw}x${chh} palette=$pl,$pt ${pw}x${ph} pitch=$pitch"
 
 $trialId = 0
@@ -229,9 +246,8 @@ $pcMenu = [VT]::FullDiff($menuBefore, $menuAfter)
 [void][VT]::Post($h, 0x0100, 0x1B)     # Esc 关闭菜单
 Start-Sleep -Milliseconds 500
 # E2: icons 0..7 x variants
-foreach ($icon in 0..7) {
-  if ($pitch -le 0) { break }
-  $iconY = $pt + [int]($pitch / 2) + $icon * $pitch
+foreach ($icon in 0..($candidateYs.Count - 1)) {
+  $iconY = $candidateYs[$icon]
   # 点图标切换模式（真实点击）
   [void][VT]::Click($h, ($pl + [int]($pw / 2)), $iconY, 1, 40, 60)
   Start-Sleep -Milliseconds 250
@@ -256,18 +272,11 @@ foreach ($icon in 0..7) {
     [void][VT]::Snap($cl, $ct, $cw, $chh, $after)      # 点击后
     $stats = [VT]::LocalStats($before, $after, $bx, $by, 160)
     $full = [VT]::FullDiff($before, $after)
-    [void]$rows.Add('{"phase":"E2","trial":' + (++$trialId) + ',"icon":' + $icon + ',"variant":"' + $variant.name + '","screen":"' + $sx + ',' + $sy + '","hit":' + $hit + ',"stats":' + $stats + ',"diffFull":' + $full + '}')
+    $fgOk = ([VT]::Fg() -eq $h)
+  [void]$rows.Add('{"phase":"E2","trial":' + (++$trialId) + ',"candidateIndex":' + $icon + ',"candidateNote":"estimated position, semantics unknown","variant":"' + $variant.name + '","screen":"' + $sx + ',' + $sy + '","hit":' + $hit + ',"fgIsTarget":' + ($(if ($fgOk) { 'true' } else { 'false' })) + ',"valid":' + ($(if ($fgOk) { 'true' } else { 'false' })) + ',"stats":' + $stats + ',"diffFull":' + $full + '}')
     Start-Sleep -Milliseconds 200
   }
 }
 
-# E3: background posted click on the same sphere (no real input)
-$c = [VT]::BlueCentroid($cl, $ct, $cw, $chh)
-if ($c) {
-  $p = $c -split ';'
-  $edges = '{"phase":"E3","note":"posted-click-via-host","target":"' + ($cl + [int]$p[0]) + ',' + ($ct + [int]$p[1]) + '"}'
-  [void]$rows.Add($edges)
-}
-
-$rows | Set-Content -Path $OutJson -Encoding UTF8
+[System.IO.File]::WriteAllLines($OutJson, [string[]]$rows, [System.Text.UTF8Encoding]::new($false))
 "trials=" + $trialId + " -> " + $OutJson

@@ -1,5 +1,7 @@
 # VESTA 交互实现复核与下一轮改进建议
 
+> **后续状态更新**：本文件保留第一轮复核快照。新 PNG 产物已可显示，最新结论与新发现的验证器问题见 [第二轮复核](VESTA-VERIFICATION-REVIEW.md)。
+
 > 2026-10-28｜针对 DSH 最新文档和未提交代码的复核。  
 > 范围：`VESTA-INTERACTION-ROADMAP.md`、`VESTA-INTERACTION-FINDINGS.md`、`VESTA-M0-M5-TESTREPORT.md`、`core.js` 和 `win/vesta-ui.ps1` 的增量改动，以及本机部分原始证据。  
 > 本次只审阅文档、源码及已有文件，没有操作 VESTA，也没有重新运行 GUI 测试。DSH 报告的成功与本次独立复核的结果应分别看待。

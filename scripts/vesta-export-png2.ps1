@@ -3,6 +3,21 @@
   [string]$OutJson = 'D:\calcf\verify\export-png2.json'
 )
 
+# 进程 DPI 感知：必须在查询/截图前声明，否则拿到的是被虚拟化的逻辑像素（120 DPI 下差 1.25 倍）
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class DpiFix {
+  [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+  [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int value);
+  public static string Enable() {
+    try { if (SetProcessDpiAwarenessContext(new IntPtr(-4))) return "per-monitor-v2"; } catch { }
+    try { if (SetProcessDpiAwareness(2) == 0) return "per-monitor"; } catch { }
+    return "unaware";
+  }
+}
+'@ -ErrorAction SilentlyContinue
+[DpiFix]::Enable() | Out-Null
 Add-Type -TypeDefinition @'
 using System;
 using System.Text;
