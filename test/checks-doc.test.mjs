@@ -14,7 +14,7 @@ const DOC = join(ROOT, 'docs', 'CHECKS.md')
 
 /** 从 inspectTask 函数体里抽出 checks.push({ name: '…' }) 的名称。 */
 const checkNames = () => {
-  const text = readFileSync(CORE, 'utf8')
+  const text = readFileSync(CORE, 'utf8').replace(/\r\n/g, '\n')
   const start = text.indexOf('export async function inspectTask')
   const end = text.indexOf('\n}\n', start)
   assert.ok(start > 0 && end > start, '找不到 inspectTask')

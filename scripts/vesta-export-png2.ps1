@@ -168,17 +168,7 @@ if ($edit -ne [IntPtr]::Zero) {
 }
 Start-Sleep -Milliseconds 2000
 
-# 后续选项框：直接回车（默认按钮是 OK）
-for ($i = 0; $i -lt 3; $i++) {
-  $follow = [EX3]::Find('Export image')
-  if ($follow -eq [IntPtr]::Zero) { $follow = [EX3]::Find('Export Graphics') }
-  if ($follow -eq [IntPtr]::Zero) { break }
-  L ("followup=" + $follow.ToInt64() + " -> Enter")
-  [EX3]::SetForegroundWindow($follow) | Out-Null
-  Start-Sleep -Milliseconds 200
-  [EX3]::Enter() | Out-Null
-  Start-Sleep -Milliseconds 1500
-}
+# 后续对话框由 Node 侧（scripts/export-png.mjs）处理
 
 $exists = Test-Path $Target
 $size = if ($exists) { (Get-Item $Target).Length } else { 0 }
