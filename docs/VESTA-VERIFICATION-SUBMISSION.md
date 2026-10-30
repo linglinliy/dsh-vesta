@@ -34,6 +34,10 @@
 | Esc 恢复到操作前画面 | supported | `restorationVerified`，区域差异 0 | 仅验证本次单目标场景；已有隐藏对象未测 |
 | 结构不变 | supported | 完整快照（位点行+晶胞参数）一致 | 不覆盖“结构删除”类操作 |
 | PNG 导出（唯一路径+哈希+尺寸） | experimental | `export-2026-10-29T15-53-50`（64,042 B，831×403，png-verified） | 尺寸来自 PNG 头，尚未做真实解码校验 |
+| `vesta_interact` observe（会话+几何版本） | supported | `35524-mvuogkv5` | 几何变化后旧 session 被拒绝 |
+| `vesta_interact` select（选中+身份+token） | supported | 同上（`Atom: 2 Si2 …`） | 需先处于 Select 模式（调用方一次点击切换） |
+| `vesta_interact` hide（Del→faded） | supported | 同上，区域差异 0.1476 | 只证明变淡，不证明完全不可见 |
+| `vesta_interact` restore（Esc→基线） | supported | 同上，区域差异 0 | 单目标、无既有隐藏对象 |
 | 候选位置 → 模式语义 | unknown | `map.jsonl` | 只知 3/4 可选中，模式名称未确认 |
 
 ## 1. 验证矩阵
@@ -379,3 +383,51 @@ node scripts/selfcheck.mjs
 | 真实图像解码 | PNG 校验仍只读文件头，未做像素解码（N5） |
 | 正式工具入口 | `index.js` 尚未接入 observe/select/hide（N6 之后的 §3） |
 | 混合 DPI / 遮挡回退 | 未测（N4 的屏幕回退路径） |
+
+## 11. 工作包 3：正式工具入口 `vesta_interact`（2026-10-30）
+
+### 11.1 接口
+
+| action | 参数 | 返回 |
+|---|---|---|
+| `observe` | `pid?` | `sessionId`、`geometryRevision`、`canvasRect`、`document`、结构行数/晶胞 |
+| `select` | `sessionId`、`x?`、`y?` | `point`、`selectionToken`、`identityLine`（本次新增 Atom 行） |
+| `hide` | `sessionId`、`selectionToken` | `effect`（faded/unknown）、`regionDiff`、`structure.unchanged` |
+| `restore` | `sessionId`、`selectionToken` | `restored`、`regionDiff`（对选中前基线） |
+
+- 实现：`interact.js`（会话表 + 几何版本 + token）；工具定义在 `index.js`（`vesta_interact`）；
+- 工具总数 28 → **29**，MCP 自述、README、PROJECT、COVERAGE、tools 测试已同步；
+- 几何一变，旧 `sessionId`/`selectionToken` 会被拒绝（`staleObservation`）。
+
+### 11.2 实跑（同一进程内连续四次工具调用）
+
+| 步骤 | 结果 |
+|---|---|
+| observe | `sessionId=35524-mvuogkv5`，画布 881×518，几何版本 `ae68f445c41c59d3` |
+| select | `point=(238,325)`，身份 `Atom: 2 Si2 Si 1.25000 0.25000 -0.75000 (1 0 -1)`，token 生成 |
+| hide | `effect=faded`，区域差异 **0.1476**，结构 **未变** |
+| restore | `restored=true`，区域差异 **0** |
+
+- 证据：`D:/calcf/verify/tool-workflow2.mjs` 的输出（本机终端）与临时截图目录。
+
+### 11.3 已知限制（诚实边界）
+
+1. **Select 模式需调用方切换**：工具不遍历工具栏猜模式（探测会误点 Properties 等按钮而卡住），所以工作流里先做一次显式点击；
+2. `hide` 的语义是 **faded（变淡）**，不是“渲染中完全不可见”；
+3. `restore` 只验证本次单目标、且事先没有隐藏对象；
+4. `select` 的自动取球依赖屏幕抓取（需要窗口在前台），显式 `x/y` 更稳。
+
+### 11.4 本轮新遇到的问题
+
+#### P17 被杀掉的任务会留下常驻宿主，阻塞后续调用
+
+- 现象：`job_kill` 之后新的工具调用在 `observe` 阶段直接卡住，无输出；
+- 原因：`core` 的常驻 PowerShell 宿主（stdin/stdout 管道）属于被杀的 node 进程，孤儿宿主仍占着资源；新进程再次启动宿主时被拖慢/阻塞；
+- 处理：清理孤儿 `powershell` 进程后恢复正常（**注意不要用 `Get-Process node | Kill`**，会把正在跑的命令一起杀掉，本轮已踩过一次）；
+- 建议：所有 GUI 脚本在 `finally` 里调用 `stopUiHost()`，任务被杀时至少让宿主进程随父进程退出。
+
+#### P18 `select` 的基线截图时序错误
+
+- 现象：`restore` 一直 `restored=false`（区域差异 0.1399）；
+- 原因：基线截图拍在了**点击之后**，带黄色选中标记；而 Esc 后标记消失，两者必然不同；
+- 处理：基线移到点击前，恢复差异变为 **0**。

@@ -52,7 +52,7 @@ try {
   const names = (list.result?.tools ?? []).map((tool) => tool.name)
   // MCP 复用插件定义，数量应与插件一致（21 个），且必须包含两个基础工具
   check('tools/list 返回插件的全部工具',
-    names.length === 28 && names.includes('vesta_open') && names.includes('vesta_info') && names.includes('check_structure'),
+    names.length === 29 && names.includes('vesta_open') && names.includes('vesta_info') && names.includes('check_structure'),
     `${names.length} 个：${names.join(',')}`)
 
   send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'vesta_info', arguments: {} } })

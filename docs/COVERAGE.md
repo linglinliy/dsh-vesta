@@ -50,6 +50,7 @@ node scripts/selfcheck.mjs                        # 端到端 72 项
 | `vesta_edit` | 扩胞/矩阵/晶胞/加删原子/替换元素/空间群/约化/对称化 | 见下节逐项 |
 | `vesta_vector` | SVG 矢量导出（球棍+晶胞+占位率） | 圆/线计数与结构一致；确定性输出 |
 | `vesta_measure` | 键长/键角/点击拾取 | Si–Si 2.3517 Å（文献 2.35） |
+| `vesta_interact` | 正式单球交互：observe/select/hide/restore（sessionId + 几何版本 + selectionToken） | E4 正例 passed、`--skip-del` 反例 failed；变淡恢复区域差异 0.1476→0 |
 | `vesta_volume_display` | 等值面/剖面开关、阈值升降 | 黄像素 17→1988→931 |
 | `vasp_dos/bands/report/batch/compare/table/trajectory/pdos` | VASP 数据可视化与体检 | 真实任务目录上跑通 |
 

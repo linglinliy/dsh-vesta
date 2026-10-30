@@ -75,7 +75,7 @@ const PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05']
 const LATEST_PROTOCOL = PROTOCOLS[0]
 
 const INSTRUCTIONS =
-  '本机 VESTA 与 VASP 后处理工具集，共 28 个工具，与 DSH 插件共用同一份实现。'
+  '本机 VESTA 与 VASP 后处理工具集，共 29 个工具，与 DSH 插件共用同一份实现。'
   + '结构：vesta_open / vesta_info / vesta_view / vesta_analyze / check_structure / slab_report；'
   + 'VESTA 控制：vesta_menu / vesta_control / vesta_capture（可指定 pid 定向到某个窗口）；'
   + 'VASP 解析与体检：vasp_report / vasp_table / vasp_batch / vasp_compare / vasp_incar 差异走 vasp_table；'
@@ -121,7 +121,7 @@ const TOOLS = PLUGIN_TOOLS.map((tool) => ({
 
 /**
  * 执行一次工具调用。
- * 插件的 28 个工具都走 callPluginTool；只有 vesta_open/vesta_info 保留专门实现，
+ * 插件的 29 个工具都走 callPluginTool；只有 vesta_open/vesta_info 保留专门实现，
  * 因为它们要回填 structuredContent（保持老客户端兼容）。
  * @param {string} name - 原始 MCP 工具名。
  * @param {unknown} args - 客户端参数。

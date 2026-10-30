@@ -30,6 +30,7 @@ const EXPECTED_TOOLS = [
   'volume_analyze', 'xray_powder', 'slab_report', 'work_function', 'check_structure', 'vesta_view',
   'vasp_dos', 'vasp_bands', 'vasp_report', 'vasp_batch', 'vasp_compare', 'vasp_table',
   'vasp_trajectory', 'vasp_pdos', 'vesta_input', 'vesta_render', 'vesta_edit', 'vesta_vector', 'volume_export', 'vesta_measure', 'vesta_volume_display', 'vesta_style',
+  'vesta_interact',
 ]
 
 test('apply：注册的工具名与预期清单一致', () => {

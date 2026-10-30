@@ -28,6 +28,7 @@ import {
   openSummary,
   operateControl,
 } from './core.js'
+import { hideSelected, observeVesta, restoreVesta, selectVesta, sessionStructure } from './interact.js'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname as dirnamePath, join as joinPath } from 'node:path'
 
@@ -312,6 +313,7 @@ export function apply(ctx, config) {
       ctx.tools.register(measureTool(ctx)),
       ctx.tools.register(volumeDisplayTool(ctx)),
       ctx.tools.register(styleTool(ctx)),
+      ctx.tools.register(interactTool()),
     ]
     // 常驻宿主是一个 powershell 子进程：插件卸载时一起收掉，避免留下僵尸进程
     disposers.unshift(() => {
@@ -2937,4 +2939,75 @@ const styleTool = (ctx) => localTool({
 function mergedExecutable(ctx) {
   const config = ctx?.config ?? {}
   return config.executable ?? config.vestaPath ?? null
+}
+
+/**
+ * `vesta_interact`：正式的单球交互入口（观测 → 选择 → 隐藏 → 恢复）。
+ *
+ * 与实验脚本的区别：返回 sessionId / geometryRevision / selectionToken，
+ * 几何一变旧坐标直接拒绝；隐藏与恢复都带区域差异判定，信息不足返回 unknown。
+ * @returns {object} 工具定义。
+ */
+function interactTool() {
+  return localTool({
+    name: 'vesta_interact',
+    description:
+      '当用户想在 VESTA 里选中某个原子、隐藏刚选中的球或把它恢复时调用它；'
+      + '对已打开的 VESTA 窗口做单球级交互：'
+      + 'observe 建立会话（返回 sessionId、几何版本、画布矩形）；'
+      + 'select 选中一个球（默认自动挑最大的球，也可给画布坐标 x/y，返回 selectionToken 与本次身份）；'
+      + 'hide 对当前选中项执行 Del 并判定是否变淡；restore 执行 Esc 并与选中前基线比较。'
+      + '几何变化后旧 sessionId/selectionToken 会被拒绝，需要重新 observe。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['observe', 'select', 'hide', 'restore'], description: 'observe=建立会话；select=选中球；hide=隐藏选中；restore=恢复' },
+        pid: { type: 'integer', description: 'VESTA 进程 pid（多窗口时指定；省略取第一个）' },
+        sessionId: { type: 'string', description: 'observe 返回的会话 id（select/hide/restore 必填）' },
+        x: { type: 'number', description: 'select 用的画布坐标 X（物理像素）；省略则自动挑最大的球' },
+        y: { type: 'number', description: 'select 用的画布坐标 Y（物理像素）' },
+        selectionToken: { type: 'string', description: 'select 返回的选择令牌（hide/restore 必填）' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        required: ['ok', 'summary'],
+        properties: {
+          ok: { type: 'boolean' },
+          summary: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.summary }],
+    },
+    presentCall: (args) => ({ card: 'generic', title: `VESTA interact: ${args.action}`, kind: 'execute', rawInput: args }),
+    async execute(args) {
+      if (args.action === 'observe') {
+        const result = await observeVesta({ pid: args.pid })
+        const canvas = result.canvasRect
+        return {
+          ...result,
+          summary: `会话 ${result.sessionId}｜文档 ${result.document}｜画布 ${canvas?.width ?? '?'}×${canvas?.height ?? '?'} @ (${canvas?.left ?? '?'},${canvas?.top ?? '?'})｜几何版本 ${result.geometryRevision}`,
+        }
+      }
+      if (args.action === 'select') {
+        const result = await selectVesta(args.sessionId, { x: args.x, y: args.y })
+        const identity = result.identityLine ? `身份 ${result.identityLine}` : '未取得身份输出'
+        return { ...result, summary: `选中点 (${result.point.x},${result.point.y})｜${identity}｜token ${result.selectionToken ?? '-'}` }
+      }
+      if (args.action === 'hide') {
+        const result = await hideSelected(args.sessionId, args.selectionToken)
+        const structure = await sessionStructure(args.sessionId)
+        return { ...result, structure, summary: `隐藏：${result.effect}（区域差异 ${result.regionDiff}）｜结构${structure.unchanged ? '未变' : '已变'}` }
+      }
+      if (args.action === 'restore') {
+        const result = await restoreVesta(args.sessionId, args.selectionToken)
+        return { ...result, summary: `恢复：${result.restored ? '已回到选中前基线' : '未完全恢复'}（区域差异 ${result.regionDiff ?? '-'}）` }
+      }
+      throw new Error(`未知 action：${args.action}`)
+    },
+  })
 }
