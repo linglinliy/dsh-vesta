@@ -79,6 +79,8 @@ node scripts/vesta-crosscheck.mjs <CHGCAR|CHG|PARCHG>   # 用 VESTA 导出文本
 node scripts/verify-vesta.mjs            # 交互验证（E1/E2 + 正对照，需 VESTA_GUI_TESTS=1）
 node scripts/verify-lib.mjs              # 验证清单解析/判定（BOM 安全，无 GUI）
 node scripts/e4-hide.mjs                   # 选中→Del 隐藏→Esc 恢复（需 VESTA_GUI_TESTS=1，结构不变）
+node scripts/e4-verify.mjs                # E4：选中→Del→Esc 闭环验证（--skip-del 为反例，需 VESTA_GUI_TESTS=1）
+node scripts/e4-lib.mjs                   # E4 判定逻辑（纯函数，供单测使用）
 node scripts/pc1-capture.mjs               # 捕获灵敏度正对照（PrintWindow，需 VESTA_GUI_TESTS=1）
 node scripts/export-png.mjs                # 导出 PNG：唯一路径 + SHA-256 + 解码尺寸
 

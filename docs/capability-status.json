@@ -1,0 +1,60 @@
+{
+  "generatedAt": "2026-10-30",
+  "source": "docs/VESTA-VERIFICATION-SUBMISSION.md §0.1（人工维护，Markdown 表由本文件生成/校对）",
+  "testedVersion": "VESTA 3.90.9a (64-bit, Build 2026-08-08)",
+  "environment": {
+    "os": "Windows",
+    "dpi": 120,
+    "node": "v24.22.0"
+  },
+  "capabilities": [
+    {
+      "id": "observe.dpi",
+      "status": "supported",
+      "evidenceRunId": "2026-10-29T15-15-35",
+      "limits": "宿主与脚本需在启动时声明 Per-Monitor DPI；声明失败不得当成功"
+    },
+    {
+      "id": "select.foreground-click",
+      "status": "supported",
+      "evidenceRunId": "2026-10-30T06-53-28-2icn",
+      "limits": "需 Select 模式；目标无遮挡"
+    },
+    {
+      "id": "select.posted-to-canvas",
+      "status": "supported",
+      "evidenceRunId": "e3b",
+      "limits": "必须投递到 wxGLCanvas 客户端坐标；根窗口无效"
+    },
+    {
+      "id": "identity.read",
+      "status": "supported",
+      "evidenceRunId": "2026-10-30T06-53-28-2icn",
+      "limits": "必须按“本次新增 Atom 行”判定，历史行不算"
+    },
+    {
+      "id": "display.del-faded",
+      "status": "supported",
+      "evidenceRunId": "2026-10-30T06-53-28-2icn",
+      "limits": "只验证变淡，未验证完全不可见"
+    },
+    {
+      "id": "restore.esc-single",
+      "status": "supported",
+      "evidenceRunId": "2026-10-30T06-53-28-2icn",
+      "limits": "仅单目标、无既有隐藏对象场景"
+    },
+    {
+      "id": "export.png",
+      "status": "experimental",
+      "evidenceRunId": "export-2026-10-29T15-53-50",
+      "limits": "尺寸来自 PNG 头，未做真实解码校验"
+    },
+    {
+      "id": "mode.mapping",
+      "status": "unknown",
+      "evidenceRunId": "map",
+      "limits": "仅知部分候选位置可选中，模式名称未确认"
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 # DSH–VESTA 交互能力优化规划
 
+> 当前复核入口（2026-10-30）：[VESTA-LATEST-REVIEW.md](VESTA-LATEST-REVIEW.md)。DPI 修正后已有选中与局部变淡/恢复证据；旧章节的阻塞状态按历史记录理解。
+
 > 面向实施者的规划与验收文档｜基于本地 `dsh-vesta` 0.0.2（commit `32ec9e2`）的静态检查｜2026-10-28
 >
 > **最新验收意见见 [验证提交第二轮复核](VESTA-VERIFICATION-REVIEW.md)**；早期实施意见见 [复核与下一轮建议](VESTA-INTERACTION-REVIEW.md)；历史实测见 [首次记录](VESTA-INTERACTION-FINDINGS.md) 和 [M0–M5 分轮报告](VESTA-M0-M5-TESTREPORT.md)。M0 部分通过，M1 选择与 M2 单球隐藏尚未验收；按能力项记录状态。
@@ -537,3 +539,10 @@ cy = (sy - sy0) * ch / sh
 针对 `VESTA-VERIFICATION-SUBMISSION.md` 的完整评审见 [VESTA-VERIFICATION-REVIEW.md](VESTA-VERIFICATION-REVIEW.md)。最新真实 PNG 文件已经可解码显示；前一轮关于没有 PNG 产物的结论仅作为历史快照保留。
 
 当前核心阻塞仍为 Select 与单球隐藏，但不能声称已排除坐标和输入问题：PC2 对应截图为其他应用界面；工具条按总高度除以 8 不能代表八种实际模式；命中画布也不证明点在球上。修复 E1 的 BOM 解析失败、捕获与目标对应、模式定位和候选触发 Delete 的判定后，先做一个原生可成功选择的对照，再验证自动点击与同事务隐藏。按第二轮复核第 5 节的七项最小任务推进，先交付可复现的小案例。
+## 23. DPI 修正后的实施重点（2026-10-30）
+
+详见 [最新复核与实施建议](VESTA-LATEST-REVIEW.md)。优先修复 E3 实际投递主窗口的测试错误和 E4 用历史文本/行数判定成功的问题；区分变淡与完全隐藏。将成功案例接入正式工具，采用会话绑定、截图版本、统一坐标、选择令牌和串行事务。截图观测与窗口规范化分离；PNG 采用完整解码。先验收正式 DSH 单球闭环，再扩展其他功能。
+
+## 24. 后续详细实施与验收
+
+完整执行方案见 [VESTA-IMPLEMENTATION-NEXT-STEPS.md](VESTA-IMPLEMENTATION-NEXT-STEPS.md)，包含阶段退出条件、模块职责、截图坐标协议、键鼠事务、Select 与实例身份、隐藏/恢复契约、错误与重试、反例测试及六个工作包。按“验证基础 → 坐标观测 → 正式选择 → 显示与恢复 → 保存导出 → 完整工作流”依赖顺序推进。

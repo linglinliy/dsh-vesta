@@ -1,5 +1,7 @@
 # VESTA 交互验证：一次性提交
 
+> 最新复核（2026-10-30）：[VESTA-LATEST-REVIEW.md](VESTA-LATEST-REVIEW.md)。选中及局部变淡/恢复已有截图证据；E3 当前实际投递主窗口，尚不能推断后台画布能力；E4 自动成功判据与 PNG 完整解码仍需补齐。以下各轮报告保留为历史，冲突状态以最新复核为准。
+
 > **第二轮复核入口**：[VESTA-VERIFICATION-REVIEW.md](VESTA-VERIFICATION-REVIEW.md)。已有 PNG 产物已独立查看并确认可显示；PC2 的对应截图为 DSH 界面，不能证明 VESTA 菜单输入可达。均分工具条未证明八种模式，命中画布未证明命中原子；E1 清单还存在 BOM 解析失败。下文保留 DSH 原始提交，结论与证据边界以第二轮复核为准。复核未重新运行 GUI。
 
 > 日期：2026-10-28｜执行者：DSH｜范围：M0–M5 + `VESTA-INTERACTION-REVIEW.md` 的 E0–E6
@@ -17,6 +19,22 @@
 - **撤回**：P1“点击原子无反馈”、P7“状态栏不可读、Text Area 不记录拾取”均由 DPI 坐标错误导致，不成立；PC1/PC2 两个正对照仍作废（屏幕捕获未校验归属）。
 
 **仍未知**：左栏 8 个候选位置各自对应哪个语义模式（选择行为已可用，但模式名未确认）。
+
+## 0.1 当前能力表（唯一权威，2026-10-30）
+
+> 其余章节按日期保留为历史记录；与本节冲突时以本节为准。状态机读副本见 `docs/capability-status.json`。
+
+| 能力 | 状态 | 依据（runId / 证据） | 限制 |
+|---|---|---|---|
+| DPI 感知观测（物理像素） | supported | `2026-10-29T15-15-35` | 宿主/脚本启动时声明；失败不得当成功 |
+| 前台真实点击选中球 | supported | `2026-10-30T06-53-28-2icn`（passed） | 需 Select 模式 + 目标无遮挡 |
+| 后台消息选中球（向画布投递） | supported | `D:/calcf/verify/e3/e3b.json`（黄色 0→880，PostMessage=True） | 必须是 `wxGLCanvas` 句柄 + 客户端坐标 |
+| 读取选中身份（Atom/Bond/状态栏） | supported | 同 e4 runId | 文本区可能滚动，需按“本次新增行”判定 |
+| Del 使目标变淡（faded） | supported | `e4-verify` effectVerified，区域差异 0.1476 | **未验证“完全不可见”** |
+| Esc 恢复到操作前画面 | supported | `restorationVerified`，区域差异 0 | 仅验证本次单目标场景；已有隐藏对象未测 |
+| 结构不变 | supported | 完整快照（位点行+晶胞参数）一致 | 不覆盖“结构删除”类操作 |
+| PNG 导出（唯一路径+哈希+尺寸） | experimental | `export-2026-10-29T15-53-50`（64,042 B，831×403，png-verified） | 尺寸来自 PNG 头，尚未做真实解码校验 |
+| 候选位置 → 模式语义 | unknown | `map.jsonl` | 只知 3/4 可选中，模式名称未确认 |
 
 ## 1. 验证矩阵
 
@@ -321,4 +339,43 @@ node scripts/selfcheck.mjs
 | 真实鼠标点击（`SetCursorPos` + `mouse_event`） | `0 → 669` | ✅ 选中 |
 
 - 证据：`D:/calcf/verify/e3/e3.json`；
-- 结论：**画布拾取只能走前台真实输入**，后台消息对 GL 画布无效——这与之前的结论一致，但这次是在“已能选中”的基线上做的对照，排除了“本来就不会选中”的干扰。
+- **2026-10-30 修正（原结论作废）**：上一版脚本把消息投递给了**根窗口**而不是画布（`PostedClick($h, …)`，`$h` 是根窗口），所以“后台无效”是投错句柄造成的假结论。
+- 修正后（向 `wxGLCanvas` hwnd=8528002 投递客户端坐标 238,325）：`PostMessage` 的 down/up 均返回 True，黄色像素 **0 → 880**；随后真实点击 880 → 880（已选中，无变化）。
+- 新结论：**后台投递在画布上可以完成选中**，前提是句柄必须是 `wxGLCanvas`、坐标必须是客户端坐标、且当前处于 Select 模式。
+- 证据：`D:/calcf/verify/e3/e3b.json`、`e3-after-posted.png`。
+
+## 10. 工作包 1 交付（按 VESTA-LATEST-REVIEW N1/N2/N4）
+
+### 10.1 E3：投递目标修正
+
+- `scripts/vesta-e3-background.ps1`：`Layout` 现在返回 **canvasHwnd**；投递走 `ScreenToClient(canvas)` 一次换算后 `PostMessage(canvas, …)`；
+- 记录：根/画布/工具栏的 hwnd、类名、PID、可见性、矩形；`postMove/postDown/postUp` 返回值；前台状态；
+- 结果见 §9.6 修正：后台投递**可以**选中，旧结论作废。
+
+### 10.2 E4：判定器重写 + 反例
+
+- 新增 `scripts/e4-lib.mjs`：`structureSnapshot`/`structureEqual`/`newAtomLines`/`e4Verdict`，**纯函数**；
+- 新增 `test/e4-lib.test.mjs` **7/7**：历史 Atom 行不算选中、不发 Del 必失败、区域无变化必失败、结构按完整字段比较、恢复差异过大判失败；
+- `scripts/e4-verify.mjs`：先探测“哪个工具栏位置具备选中能力”（逐个候选点 → 点球 → 看是否新增 Atom 行），再在同一事务里选中→截图→Del→截图→Esc→截图→判定；
+- 截图改用 `scripts/capture-window.ps1`：**只 PrintWindow，不恢复/不移动/不置前**，坐标不再失效；
+- 恢复基线改为“选中前画面”，因为 Esc 会连黄色标记一起清掉；
+- 退出码：0 全部成立 / 1 有判定为假 / 2 基础设施失败。
+
+### 10.3 实跑结果
+
+| 场景 | 命令 | 结果 |
+|---|---|---|
+| 正例 | `node scripts/e4-verify.mjs` | **passed**（selectionObserved/identityResolved/effectVerified/restorationVerified/structureUnchanged 全 true；区域差异 0.1476；恢复 0） |
+| 反例（不发 Del） | `node scripts/e4-verify.mjs --skip-del` | **failed**（`effectVerified:false`，exit 1）——证明判据不会假阳性 |
+
+- 证据：`D:/calcf/verify/e4-2026-10-30T06-53-28-2icn/`、`e4-2026-10-30T06-55-34-gmmu/`。
+
+### 10.4 仍未解决
+
+| 项 | 说明 |
+|---|---|
+| “完全不可见” | 现在只证明“变淡（faded）”，未验证渲染中完全不可见（N3） |
+| 已有隐藏对象时的 Esc 范围 | 未测（N3） |
+| 真实图像解码 | PNG 校验仍只读文件头，未做像素解码（N5） |
+| 正式工具入口 | `index.js` 尚未接入 observe/select/hide（N6 之后的 §3） |
+| 混合 DPI / 遮挡回退 | 未测（N4 的屏幕回退路径） |
